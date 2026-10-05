@@ -7,17 +7,21 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import threading
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 MAX_BLOB = 1_048_576
+CHUNK_MAX = 262_144
+UPLOAD_ID_BYTES = 16  # token_hex(16) -> 32 lowercase hex characters
 DIGEST_LENGTH = 64
 MAX_LIMIT = 100
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
+_UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class StoreError(Exception):
@@ -35,6 +39,10 @@ class BlobNotFound(StoreError):
 
 class DigestConflict(StoreError):
     code, status = "conflict", 409
+
+
+class UploadConflict(DigestConflict):
+    """A resumable upload session is in the wrong state for the requested action."""
 
 
 def is_digest(value: Any) -> bool:
@@ -196,8 +204,174 @@ class Store:
             return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
                     "puts": sum(self._refs.values())}
 
+    def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
+        """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
+        digest = digest_of(data)
+        if declared_digest is not None and declared_digest != digest:
+            raise DigestConflict(f"declared {declared_digest} does not match computed {digest}")
+        with self._lock:
+            if digest in self._blobs:
+                self._refs[digest] += 1
+            else:
+                self._blobs[digest] = data
+                self._meta[digest] = Blob(digest, len(data), media_type)
+                self._refs[digest] = 1
+            return self._meta[digest]
 
-def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
+
+@dataclass
+class UploadSession:
+    upload_id: str
+    size: int
+    media_type: str
+    declared_digest: str | None = None
+    chunks: list[bytes] = field(default_factory=list)
+    received: int = 0
+    committed: bool = False
+    deleted: bool = False
+    final_digest: str | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def snapshot(self) -> dict[str, Any]:
+        """GET shape; caller must hold self.lock. Digest appears only when known."""
+        body: dict[str, Any] = {
+            "size": self.size,
+            "received": self.received,
+            "media_type": self.media_type,
+            "status": "committed" if self.committed else "uncommitted",
+        }
+        digest = self.final_digest if self.committed else self.declared_digest
+        if digest is not None:
+            body["digest"] = digest
+        return body
+
+
+class UploadNotFound(StoreError):
+    code, status = "not_found", 404
+
+
+class UploadManager:
+    """Process-memory resumable uploads; each append/delete/complete is atomic per session.
+
+    Deleted sessions stay in the table as tombstones, so an id is never reissued and a
+    delete is strictly serialized against concurrent writes on the same session lock.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self._lock = threading.Lock()
+        self._sessions: dict[str, UploadSession] = {}
+
+    @staticmethod
+    def parse_create(raw: bytes) -> tuple[int, str, str | None]:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InvalidRequest("request body must be a JSON object") from error
+        if not isinstance(payload, dict):
+            raise InvalidRequest("request body must be a JSON object")
+        if "size" not in payload:
+            raise InvalidRequest("size is required")
+        size = payload["size"]
+        # bool is an int subclass; reject it explicitly along with floats and non-ints
+        if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= MAX_BLOB:
+            raise InvalidRequest(f"size must be an integer between 1 and {MAX_BLOB}")
+        if "media_type" not in payload:
+            raise InvalidRequest("media_type is required")
+        media_type = payload["media_type"]
+        if not isinstance(media_type, str) or not media_type or len(media_type) > 200:
+            raise InvalidRequest("media_type must be a non-empty string of at most 200 characters")
+        declared: str | None = None
+        if "digest" in payload:
+            declared = payload["digest"]
+            if not is_digest(declared):
+                raise InvalidRequest("digest must be 64 lowercase hex characters")
+        extra = set(payload) - {"size", "media_type", "digest"}
+        if extra:
+            raise InvalidRequest(f"unknown field {sorted(extra)[0]!r}")
+        return size, media_type, declared
+
+    def create(self, size: int, media_type: str, declared_digest: str | None) -> UploadSession:
+        with self._lock:
+            while True:
+                upload_id = secrets.token_hex(UPLOAD_ID_BYTES)
+                if upload_id not in self._sessions:
+                    break
+            session = UploadSession(upload_id, size, media_type, declared_digest)
+            self._sessions[upload_id] = session
+            return session
+
+    def _live(self, upload_id: str) -> UploadSession:
+        with self._lock:
+            session = self._sessions.get(upload_id)
+        if session is None or session.deleted:
+            raise UploadNotFound(f"no upload session {upload_id}")
+        return session
+
+    def get(self, upload_id: str) -> UploadSession:
+        return self._live(upload_id)
+
+    def view(self, upload_id: str) -> dict[str, Any]:
+        """Consistent GET snapshot; serialized against delete on the same session lock."""
+        session = self._live(upload_id)
+        with session.lock:
+            if session.deleted:
+                raise UploadNotFound(f"no upload session {upload_id}")
+            return session.snapshot()
+
+    def append(self, upload_id: str, offset: int, chunk: bytes) -> UploadSession:
+        # Request-shape validation (400) precedes routing/state errors.
+        if not chunk:
+            raise InvalidRequest("chunk must not be empty")
+        if len(chunk) > CHUNK_MAX:
+            raise InvalidRequest(f"chunk must be at most {CHUNK_MAX} bytes")
+        session = self._live(upload_id)
+        with session.lock:
+            # A concurrent delete (serialized on this same lock) may have tombstoned it.
+            if session.deleted:
+                raise UploadNotFound(f"no upload session {upload_id}")
+            if session.committed:
+                raise UploadConflict("upload session is already committed")
+            if offset != session.received:
+                raise UploadConflict(f"offset {offset} does not match received {session.received}")
+            if session.received + len(chunk) > session.size:
+                raise UploadConflict("chunk would exceed the declared size")
+            session.chunks.append(chunk)
+            session.received += len(chunk)
+            return session
+
+    def delete(self, upload_id: str) -> None:
+        session = self._live(upload_id)
+        with session.lock:
+            if session.committed:
+                raise UploadConflict("upload session is already committed")
+            # 204 wins exactly once: the id stays in the table as an invisible tombstone.
+            session.deleted = True
+            session.chunks.clear()
+
+    def complete(self, upload_id: str) -> tuple[UploadSession, Blob]:
+        session = self._live(upload_id)
+        with session.lock:
+            if session.deleted:
+                raise UploadNotFound(f"no upload session {upload_id}")
+            if session.committed:
+                raise UploadConflict("upload session is already committed")
+            if session.received != session.size:
+                raise UploadConflict(
+                    f"received {session.received} of {session.size} bytes; cannot complete")
+            data = b"".join(session.chunks)
+            # DigestConflict propagates before any state change: no blob, session stays resumable.
+            blob = self._store.put_completed(data, session.declared_digest, session.media_type)
+            session.committed = True
+            session.final_digest = blob.digest
+            session.chunks.clear()  # bytes now live in the store
+        return session, blob
+
+
+def make_handler(store: Store, uploads: UploadManager | None = None) -> type[BaseHTTPRequestHandler]:
+    if uploads is None:
+        uploads = UploadManager(store)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "artifact-store/0.1"
         protocol_version = "HTTP/1.1"
@@ -219,7 +393,7 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
         def _parts(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
-        def _read_body(self) -> bytes:
+        def _read_body(self, max_size: int = MAX_BLOB + 1024) -> bytes:
             length = self.headers.get("Content-Length")
             if length is None:
                 raise InvalidRequest("Content-Length is required")
@@ -227,8 +401,8 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
                 size = int(length)
             except ValueError as error:
                 raise InvalidRequest("Content-Length must be an integer") from error
-            if size < 0 or size > MAX_BLOB + 1024:
-                raise InvalidRequest(f"Content-Length must be between 0 and {MAX_BLOB}")
+            if size < 0 or size > max_size:
+                raise InvalidRequest(f"Content-Length must be between 0 and {max_size}")
             return self.rfile.read(size) if size else b""
 
         def do_GET(self) -> None:  # noqa: N802
@@ -247,6 +421,10 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     blob = store.head(parts[2])
                     return self._send(200, store.get(parts[2]), blob.media_type)
+                if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
+                    if not _UPLOAD_ID.fullmatch(parts[2]):
+                        raise InvalidRequest("upload_id must be 32 lowercase hex characters")
+                    return self._send(200, uploads.view(parts[2]))
                 return self._send(404, {"error": {"code": "not_found"}})
             except StoreError as error:
                 return self._send_error(error)
@@ -273,16 +451,74 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
         def do_PUT(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
-                if parts != ["v1", "blobs"]:
-                    return self._send(404, {"error": {"code": "not_found"}})
-                blob = store.put(self._read_body(), self.headers.get("X-Blob-Digest"), self.headers.get("Content-Type"))
-                self.send_response(201)
-                self.send_header("X-Blob-Digest", blob.digest)
-                raw = json.dumps({"digest": blob.digest, "size": blob.size, "media_type": blob.media_type}).encode()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                if parts == ["v1", "blobs"]:
+                    blob = store.put(self._read_body(), self.headers.get("X-Blob-Digest"),
+                                     self.headers.get("Content-Type"))
+                    self.send_response(201)
+                    self.send_header("X-Blob-Digest", blob.digest)
+                    raw = json.dumps({"digest": blob.digest, "size": blob.size,
+                                      "media_type": blob.media_type}).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
+                    if not _UPLOAD_ID.fullmatch(parts[2]):
+                        raise InvalidRequest("upload_id must be 32 lowercase hex characters")
+                    body = self._read_body(CHUNK_MAX)
+                    offset_header = self.headers.get("X-Upload-Offset")
+                    if offset_header is None:
+                        raise InvalidRequest("X-Upload-Offset is required")
+                    if not _DECIMAL.fullmatch(offset_header):
+                        raise InvalidRequest("X-Upload-Offset must be a non-negative decimal integer")
+                    offset = int(offset_header)
+                    session = uploads.append(parts[2], offset, body)
+                    return self._send(200, {"received": session.received,
+                                            "status": "committed" if session.committed else "uncommitted"})
+                return self._send(404, {"error": {"code": "not_found"}})
+            except StoreError as error:
+                return self._send_error(error)
+            except Exception:
+                return self._send(500, {"error": {"code": "internal_error"}})
+
+        def do_POST(self) -> None:  # noqa: N802
+            try:
+                parts = self._parts()
+                if parts == ["v1", "uploads"]:
+                    raw = self._read_body(MAX_BLOB + 1024)
+                    size, media_type, declared = UploadManager.parse_create(raw)
+                    session = uploads.create(size, media_type, declared)
+                    return self._send(201, {"upload_id": session.upload_id, "size": session.size,
+                                            "received": 0, "status": "uncommitted"})
+                if len(parts) == 4 and parts[:2] == ["v1", "uploads"] and parts[3] == "complete":
+                    if not _UPLOAD_ID.fullmatch(parts[2]):
+                        raise InvalidRequest("upload_id must be 32 lowercase hex characters")
+                    # complete carries no semantics in its body; drain any bytes to keep
+                    # the keep-alive connection usable rather than treating them as an error.
+                    if self.headers.get("Content-Length") is not None:
+                        self._read_body(MAX_BLOB + 1024)
+                    session, blob = uploads.complete(parts[2])
+                    return self._send(201, {"digest": blob.digest, "size": blob.size,
+                                            "media_type": blob.media_type})
+                return self._send(404, {"error": {"code": "not_found"}})
+            except StoreError as error:
+                return self._send_error(error)
+            except Exception:
+                return self._send(500, {"error": {"code": "internal_error"}})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            try:
+                parts = self._parts()
+                if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
+                    if not _UPLOAD_ID.fullmatch(parts[2]):
+                        raise InvalidRequest("upload_id must be 32 lowercase hex characters")
+                    uploads.delete(parts[2])
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                return self._send(404, {"error": {"code": "not_found"}})
             except StoreError as error:
                 return self._send_error(error)
             except Exception:
@@ -293,8 +529,10 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
 
 def serve(host: str = "127.0.0.1", port: int = 18895) -> ThreadingHTTPServer:
     store = Store()
-    httpd = ThreadingHTTPServer((host, port), make_handler(store))
+    uploads = UploadManager(store)
+    httpd = ThreadingHTTPServer((host, port), make_handler(store, uploads))
     httpd.store = store  # type: ignore[attr-defined]
+    httpd.uploads = uploads  # type: ignore[attr-defined]
     return httpd
 
 

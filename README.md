@@ -40,15 +40,50 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 `next_cursor`：有后续记录时为本页最后一条 digest，否则为 `null`。`stats` 始终描述全部 blob，不受过滤与分页影响。单次请求基于同一时刻的元数据快照生成完整结果。未知或重复参数、缺失或非法值 ⇒ `400 invalid_request`。
 
+## 可恢复上传会话
+
+把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。会话仅存于当前进程内存，重启不恢复。
+
+### `POST /v1/uploads`
+创建会话，JSON 体：
+
+- `size`：**必填**整数，`1..1048576`（不接受浮点、布尔、字符串）。
+- `media_type`：**必填**非空字符串，至多 200 字符。
+- `digest`：可选，64 位小写十六进制 SHA-256，作为完整性声明。
+
+成功：`201 {"upload_id","size","received":0,"status":"uncommitted"}`；`upload_id` 为 32 位小写十六进制串，进程内唯一且不复用。非法 JSON、缺失/非法字段或未知字段 ⇒ `400 invalid_request`。
+
+### `PUT /v1/uploads/{upload_id}`
+追加一个原始分片：
+
+- 必须带头 `X-Upload-Offset: <十进制非负整数>`，值须等于当前 `received`。
+- 分片非空且 ≤ 262144 字节；追加后不得越过会话 `size`。
+- 成功：`200 {"received":<新偏移>,"status":"uncommitted"}`。
+- offset 缺失/非十进制、分片为空或超 256 KiB ⇒ `400 invalid_request`；offset 与 `received` 不一致或越过 `size` ⇒ `409 conflict`（该字节不写入）。
+
+### `GET /v1/uploads/{upload_id}`
+`200 {"size","received","media_type","status",["digest":声明值]}`，供客户端决定续传偏移。`digest` 仅在创建时声明（或已提交得到实际值）时出现。
+
+### `DELETE /v1/uploads/{upload_id}`
+`204` 放弃会话；此后同一 id 对 GET/PUT/DELETE/complete 一律 `404 not_found`（id 不复用）。对已提交会话删除 ⇒ `409 conflict`。
+
+### `POST /v1/uploads/{upload_id}/complete`
+- 仅当 `received == size`：计算整体 SHA-256。声明 `digest` 不匹配 ⇒ `409 conflict`，**不建 blob**，会话保持 `uncommitted` 可续传或删除。
+- 匹配（或未声明）：`201 {"digest","size","media_type"}`，blob 进入内容寻址存储（相同字节只存一份、refs +1），会话状态变 `committed`。
+- 未收齐、重复 complete、或会话已删除 ⇒ `409 conflict` / `404 not_found`。
+
+已提交会话仍可 `GET`（`status:"committed"`, `digest` 为实际值），但对其写入或删除 ⇒ `409 conflict`。
+
+`upload_id` 格式非法（非 32 位小写十六进制）在上述四个动词上一律 `400 invalid_request`；格式合法但未知/已删除 ⇒ `404 not_found`。同一会话的并发写按请求逐个**原子**裁决：恰有一个请求成功，其余得到 `conflict`/`not_found`，不产生重叠、空洞或撕裂字节。
+
 ## 错误语义
 
 ```json
 {"error": {"code": "invalid_request|not_found|conflict|internal_error", "message": "<可读说明>"}}
 ```
 
-优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `conflict`。
+优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `conflict`（如分片本身非法先于 offset 冲突，`upload_id` 格式非法先于会话查找）。
 
 ## 未实现（后续任务候选，非固定题单）
 
-分块与增量去重、上传会话与断点续传、垃圾回收与引用策略、签名与信任链、镜像同步、依赖图与版本约束求解、
-并发上传一致性、审计与可观测性。
+增量去重、垃圾回收与引用策略、签名与信任链、镜像同步、依赖图与版本约束求解、审计与可观测性、上传会话跨进程持久化与重启恢复。
