@@ -41,6 +41,16 @@ class DigestConflict(StoreError):
     code, status = "conflict", 409
 
 
+class RangeNotSatisfiable(StoreError):
+    """A syntactically valid Range that cannot intersect the blob."""
+
+    code, status = "conflict", 416
+
+    def __init__(self, message: str, size: int) -> None:
+        super().__init__(message)
+        self.size = size
+
+
 class UploadConflict(DigestConflict):
     """A resumable upload session is in the wrong state for the requested action."""
 
@@ -151,6 +161,68 @@ def parse_blob_query(query_string: str) -> dict[str, Any]:
     return filters
 
 
+def parse_range(value: str, size: int) -> tuple[int, int]:
+    """Parse a single bytes= range against a blob of `size` bytes into a closed [first, last].
+
+    Returns the inclusive byte positions to send. Only bytes=first-last,
+    bytes=first- and bytes=-suffix are legal. Malformed syntax (whitespace,
+    multiple ranges, a non-bytes unit, non-decimal bounds, both bounds omitted,
+    a zero suffix) is an InvalidRequest (400). A well-formed range that cannot
+    intersect the blob (start at/beyond the size, or last before first) is a
+    RangeNotSatisfiable (416); overlong last clamps to the final byte.
+    """
+    if not value.startswith("bytes="):
+        raise InvalidRequest("Range must use the bytes unit")
+    spec = value[len("bytes="):]
+    if spec == "" or any(c.isspace() for c in spec):
+        raise InvalidRequest("Range must not be empty or contain whitespace")
+    if "," in spec:
+        raise InvalidRequest("Range must contain exactly one range")
+    bounds = spec.split("-")
+    if len(bounds) != 2:
+        raise InvalidRequest("Range must be bytes=first-last, bytes=first- or bytes=-suffix")
+    first_text, last_text = bounds
+    if first_text == "" and last_text == "":
+        raise InvalidRequest("Range must give a first position or a suffix length")
+    if first_text and not _DECIMAL.fullmatch(first_text):
+        raise InvalidRequest("Range bounds must be non-negative decimal integers")
+    if last_text and not _DECIMAL.fullmatch(last_text):
+        raise InvalidRequest("Range bounds must be non-negative decimal integers")
+    if first_text == "":
+        suffix = int(last_text)
+        if suffix == 0:
+            raise InvalidRequest("Range suffix length must be at least 1")
+        if suffix >= size:
+            return 0, size - 1
+        return size - suffix, size - 1
+    first = int(first_text)
+    if first >= size:
+        raise RangeNotSatisfiable(
+            f"range start {first} is at or beyond the blob size of {size}", size)
+    if last_text == "":
+        return first, size - 1
+    last = int(last_text)
+    if last < first:
+        raise RangeNotSatisfiable(
+            f"range last position {last} is before first position {first}", size)
+    return first, min(last, size - 1)
+
+
+_ETAG = re.compile(r'"[0-9a-f]{64}"')
+
+
+def parse_if_range(value: str) -> str:
+    """Validate an If-Range header: only a quoted ETag wrapping a blob digest.
+
+    Returns the digest inside the quotes; matching it against the current blob
+    is the caller's job. Anything that is not exactly "<64 lowercase hex>" is
+    an InvalidRequest — dates, weak tags and other validators are unsupported.
+    """
+    if not _ETAG.fullmatch(value):
+        raise InvalidRequest('If-Range must be a quoted ETag of the form "<64 lowercase hex>"')
+    return value[1:-1]
+
+
 @dataclass(frozen=True)
 class Blob:
     digest: str
@@ -198,6 +270,20 @@ class Store:
             if digest not in self._blobs:
                 raise BlobNotFound(f"no blob {digest}")
             return self._blobs[digest]
+
+    def read(self, digest: Any) -> tuple[Blob, bytes]:
+        """Return metadata and bytes in one lock acquisition.
+
+        The bytes object is immutable; a release followed by gc() during the
+        response removes the dict entry but cannot alter or reclaim the bytes
+        this request already holds, so the client receives one consistent copy.
+        """
+        if not is_digest(digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if digest not in self._blobs:
+                raise BlobNotFound(f"no blob {digest}")
+            return self._meta[digest], self._blobs[digest]
 
     def head(self, digest: Any) -> Blob:
         if not is_digest(digest):
@@ -511,7 +597,54 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
             self.wfile.write(raw)
 
         def _send_error(self, error: StoreError) -> None:
+            if isinstance(error, RangeNotSatisfiable):
+                # 416 states the current length so the client can rebuild its range.
+                body = json.dumps({"error": {"code": error.code, "message": str(error)}}).encode("utf-8")
+                self.send_response(error.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", f"bytes */{error.size}")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
+
+        def _single_header(self, name: str) -> str | None:
+            values = self.headers.get_all(name)
+            if not values:
+                return None
+            if len(values) > 1:
+                raise InvalidRequest(f"{name} must appear at most once")
+            return values[0]
+
+        def _send_blob(self, status: int, data: bytes, blob: Blob,
+                       extra_headers: dict[str, str] | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", blob.media_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Blob-Digest", blob.digest)
+            self.send_header("ETag", f'"{blob.digest}"')
+            self.send_header("Accept-Ranges", "bytes")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _get_blob(self, digest: str) -> None:
+            # If-Range shape (400) is checked first, then the digest lookup
+            # (400/404); one snapshot of (metadata, bytes) then serves the whole
+            # response, and the Range itself is resolved against it. A release/gc
+            # landing afterwards cannot change the bytes captured at request start.
+            range_value = self._single_header("Range")
+            if_range_value = self._single_header("If-Range")
+            if_range = parse_if_range(if_range_value) if if_range_value is not None else None
+            blob, data = store.read(digest)
+            if range_value is not None and (if_range is None or if_range == blob.digest):
+                first, last = parse_range(range_value, blob.size)  # 400 or 416 on failure
+                return self._send_blob(206, data[first:last + 1], blob,
+                                       {"Content-Range": f"bytes {first}-{last}/{blob.size}"})
+            # No Range, or an If-Range that does not match the current digest: full body.
+            return self._send_blob(200, data, blob)
 
         def _parts(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
@@ -542,8 +675,7 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                              for b, refs in items]
                     return self._send(200, {"blobs": blobs, "stats": stats})
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
-                    blob = store.head(parts[2])
-                    return self._send(200, store.get(parts[2]), blob.media_type)
+                    return self._get_blob(parts[2])
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
                     return self._send(200, store.graph(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
@@ -565,6 +697,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     self.send_header("Content-Length", str(blob.size))
                     self.send_header("Content-Type", blob.media_type)
                     self.send_header("X-Blob-Digest", blob.digest)
+                    self.send_header("ETag", f'"{blob.digest}"')
+                    self.send_header("Accept-Ranges", "bytes")
                     self.end_headers()
                     return
                 self.send_response(404)

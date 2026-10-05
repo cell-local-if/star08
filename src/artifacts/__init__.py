@@ -7,6 +7,7 @@ from .app import (  # noqa: F401
     BlobNotFound,
     DigestConflict,
     InvalidRequest,
+    RangeNotSatisfiable,
     Store,
     StoreError,
     UploadConflict,
@@ -16,7 +17,9 @@ from .app import (  # noqa: F401
     digest_of,
     is_digest,
     make_handler,
+    parse_if_range,
     parse_manifest,
+    parse_range,
     serve,
 )
 
@@ -27,6 +30,7 @@ __all__ = [
     "BlobNotFound",
     "DigestConflict",
     "InvalidRequest",
+    "RangeNotSatisfiable",
     "Store",
     "StoreError",
     "UploadConflict",
@@ -36,6 +40,8 @@ __all__ = [
     "digest_of",
     "is_digest",
     "make_handler",
+    "parse_if_range",
     "parse_manifest",
+    "parse_range",
     "serve",
 ]

@@ -25,8 +25,24 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 ### `GET /v1/blobs/{digest}`
 返回原始字节（`Content-Type` 为存入时的 media type）。未知摘要 ⇒ `404`；摘要格式非法 ⇒ `400`。
 
+不带 `Range` 时返回 `200`、完整原始字节及准确 `Content-Length`，并带：
+
+- `ETag: "<digest>"`（64 位小写十六进制摘要的强引号实体标签）。
+- `Accept-Ranges: bytes`。
+
+`Range` 只接受**单个 bytes 闭区间**，从零开始计数，合法形式为 `bytes=first-last`、`bytes=first-`、`bytes=-suffix`（边界均为十进制非负整数；`suffix` 表示末尾 N 字节且不能为 0）。合法请求返回 `206`：
+
+- 响应体为对应闭区间字节，`Content-Length` 为实际返回字节数；末尾超出 blob 时 `last` 截断到 size−1，`-suffix` 大于等于整长时返回整份。
+- `Content-Range: bytes first-last/size`、`X-Blob-Digest: <digest>`，并同样带 `ETag`、`Accept-Ranges` 与存入时的 `Content-Type`。
+
+以下情况**不得**返回部分内容：首尾都省略（`bytes=-`）、`last < first`、`first >= size`（`bytes=size-` 同）、`suffix` 为 0、多个区间（含逗号）、重复 `Range` 头、非 `bytes` 单位（大小写敏感）、含空白或非法十进制边界。其中**格式合法但与 blob 无法相交**（`first >= size` 或 `last < first`）⇒ `416`，带 `Content-Range: bytes */size` 与 `{"error":{"code":"conflict","message":...}}`；其余格式问题 ⇒ `400 invalid_request`。
+
+`If-Range` 只接受与**当前 digest 对应**的引号 ETag（`"<64 位小写十六进制>"`，不接受日期、弱标签或其他形式）：匹配时按 `Range` 截取；不匹配时**忽略 Range** 返回完整 `200`（即使该 Range 本身会 416）。`If-Range` 格式非法 ⇒ `400 invalid_request`。
+
+该入口只读：不改变摘要、media type、refs 或回收时机。响应字节在请求开始时一次取得；读取期间该 blob 被释放并回收，已在途的请求仍返回同一份字节，之后新请求才得到 `404`。
+
 ### `HEAD /v1/blobs/{digest}`
-`200` + `X-Blob-Digest`/`Content-Length`/`Content-Type`，无体；未知 ⇒ `404`。
+`200` + `X-Blob-Digest`/`Content-Length`/`Content-Type`/`ETag`/`Accept-Ranges`（与 GET 报告同一组摘要、大小与 media type），无体；未知 ⇒ `404`。
 
 ### `GET /v1/blobs`
 `200 {"blobs": [{"digest","size","media_type","refs"}...（按 digest 字典序）], "stats": {"blobs","bytes","puts"}}`
