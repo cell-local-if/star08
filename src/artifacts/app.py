@@ -42,6 +42,57 @@ def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+LIST_PARAMS = ("digest_prefix", "min_size", "max_size", "min_refs", "limit", "after")
+
+
+def _decimal(value: str, name: str) -> int:
+    if not value or any(c not in "0123456789" for c in value):
+        raise InvalidRequest(f"{name} must be a non-negative decimal integer")
+    return int(value)
+
+
+def parse_list_query(query: str) -> dict[str, Any]:
+    """Validate the GET /v1/blobs query string; every violation is a 400, never silently ignored."""
+    raw: dict[str, str] = {}
+    for segment in query.split("&"):
+        key, sep, value = segment.partition("=")
+        if not sep or key not in LIST_PARAMS:
+            raise InvalidRequest(f"unknown query parameter in {segment!r}")
+        if key in raw:
+            raise InvalidRequest(f"duplicate query parameter {key!r}")
+        if value == "":
+            raise InvalidRequest(f"query parameter {key!r} needs a value")
+        raw[key] = value
+    filters: dict[str, Any] = {}
+    if "digest_prefix" in raw:
+        prefix = raw["digest_prefix"]
+        if not 1 <= len(prefix) <= DIGEST_LENGTH or any(c not in "0123456789abcdef" for c in prefix):
+            raise InvalidRequest("digest_prefix must be 1 to 64 lowercase hex characters")
+        filters["digest_prefix"] = prefix
+    for name in ("min_size", "max_size"):
+        if name in raw:
+            bound = _decimal(raw[name], name)
+            if bound > MAX_BLOB:
+                raise InvalidRequest(f"{name} must be at most {MAX_BLOB}")
+            filters[name] = bound
+    if "min_refs" in raw:
+        filters["min_refs"] = _decimal(raw["min_refs"], "min_refs")
+    if "limit" in raw:
+        limit = _decimal(raw["limit"], "limit")
+        if not 1 <= limit <= 100:
+            raise InvalidRequest("limit must be between 1 and 100")
+        filters["limit"] = limit
+    if "after" in raw:
+        if not is_digest(raw["after"]):
+            raise InvalidRequest("after must be 64 lowercase hex characters")
+        if "limit" not in raw:
+            raise InvalidRequest("after requires limit")
+        filters["after"] = raw["after"]
+    if "min_size" in filters and "max_size" in filters and filters["min_size"] > filters["max_size"]:
+        raise InvalidRequest("min_size must not exceed max_size")
+    return filters
+
+
 @dataclass(frozen=True)
 class Blob:
     digest: str
@@ -103,10 +154,41 @@ class Store:
             return [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": self._refs[b.digest]}
                     for b in sorted(self._meta.values(), key=lambda item: item.digest)]
 
+    def _stats_locked(self) -> dict[str, Any]:
+        return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+                "puts": sum(self._refs.values())}
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
-                    "puts": sum(self._refs.values())}
+            return self._stats_locked()
+
+    def page(self, *, digest_prefix: str | None = None, min_size: int | None = None,
+             max_size: int | None = None, min_refs: int | None = None, limit: int | None = None,
+             after: str | None = None) -> dict[str, Any]:
+        """One filtered, digest-ordered page plus global stats from a single metadata snapshot."""
+        with self._lock:
+            rows = []
+            for blob in sorted(self._meta.values(), key=lambda item: item.digest):
+                if digest_prefix is not None and not blob.digest.startswith(digest_prefix):
+                    continue
+                if min_size is not None and blob.size < min_size:
+                    continue
+                if max_size is not None and blob.size > max_size:
+                    continue
+                refs = self._refs[blob.digest]
+                if min_refs is not None and refs < min_refs:
+                    continue
+                if after is not None and blob.digest <= after:
+                    continue
+                rows.append({"digest": blob.digest, "size": blob.size, "media_type": blob.media_type,
+                             "refs": refs})
+            stats = self._stats_locked()
+        if limit is not None:
+            page_rows, has_more = rows[:limit], len(rows) > limit
+        else:
+            page_rows, has_more = rows, False
+        next_cursor = page_rows[-1]["digest"] if has_more and page_rows else None
+        return {"blobs": page_rows, "next_cursor": next_cursor, "stats": stats}
 
 
 def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
@@ -149,7 +231,10 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if parts == ["v1", "blobs"]:
-                    return self._send(200, {"blobs": store.listing(), "stats": store.stats()})
+                    query = self.path.partition("?")[2]
+                    if not query:
+                        return self._send(200, {"blobs": store.listing(), "stats": store.stats()})
+                    return self._send(200, store.page(**parse_list_query(query)))
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     blob = store.head(parts[2])
                     return self._send(200, store.get(parts[2]), blob.media_type)
