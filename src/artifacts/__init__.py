@@ -13,9 +13,11 @@ from .app import (  # noqa: F401
     UploadManager,
     UploadNotFound,
     UploadSession,
+    build_graph,
     digest_of,
     is_digest,
     make_handler,
+    parse_manifest,
     serve,
 )
 
@@ -32,8 +34,10 @@ __all__ = [
     "UploadManager",
     "UploadNotFound",
     "UploadSession",
+    "build_graph",
     "digest_of",
     "is_digest",
     "make_handler",
+    "parse_manifest",
     "serve",
 ]

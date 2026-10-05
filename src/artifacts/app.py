@@ -61,6 +61,108 @@ def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+MANIFEST_FIELD_MAX = 100
+MANIFEST_CONSTRAINT_MAX = 200
+_MANIFEST_KEYS = frozenset({"name", "version", "dependencies"})
+_DEPENDENCY_KEYS = frozenset({"digest", "constraint"})
+
+
+def parse_manifest(data: bytes) -> dict[str, Any]:
+    """Validate raw blob bytes as a dependency manifest; every violation is a DigestConflict.
+
+    Returns the normalized form: {"name", "version", "dependencies": {name: {"digest", "constraint"}}}
+    where a missing `dependencies` object becomes {} and a missing `constraint` becomes None.
+    """
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DigestConflict("manifest must be a UTF-8 JSON object") from error
+    if not isinstance(payload, dict):
+        raise DigestConflict("manifest must be a UTF-8 JSON object")
+    extra = set(payload) - _MANIFEST_KEYS
+    if extra:
+        raise DigestConflict(f"manifest has unknown field {sorted(extra)[0]!r}")
+    for key in ("name", "version"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value or len(value) > MANIFEST_FIELD_MAX:
+            raise DigestConflict(
+                f"manifest {key} must be a non-empty string of at most {MANIFEST_FIELD_MAX} characters")
+    dependencies = payload.get("dependencies", {})
+    if not isinstance(dependencies, dict):
+        raise DigestConflict("manifest dependencies must be an object")
+    normalized: dict[str, dict[str, Any]] = {}
+    for dep_name, spec in dependencies.items():
+        if not isinstance(spec, dict):
+            raise DigestConflict(f"dependency {dep_name!r} must be an object")
+        extra = set(spec) - _DEPENDENCY_KEYS
+        if extra:
+            raise DigestConflict(f"dependency {dep_name!r} has unknown field {sorted(extra)[0]!r}")
+        dep_digest = spec.get("digest")
+        if not is_digest(dep_digest):
+            raise DigestConflict(f"dependency {dep_name!r} digest must be 64 lowercase hex characters")
+        constraint = spec.get("constraint")
+        if constraint is not None and (
+                not isinstance(constraint, str) or not constraint
+                or len(constraint) > MANIFEST_CONSTRAINT_MAX):
+            raise DigestConflict(
+                f"dependency {dep_name!r} constraint must be a non-empty string "
+                f"of at most {MANIFEST_CONSTRAINT_MAX} characters")
+        normalized[dep_name] = {"digest": dep_digest, "constraint": constraint}
+    return {"name": payload["name"], "version": payload["version"], "dependencies": normalized}
+
+
+def build_graph(root: str, blobs: dict[str, bytes]) -> dict[str, Any]:
+    """Resolve the manifest graph reachable from `root` against a blob snapshot.
+
+    Pure and read-only: `blobs` is a consistent snapshot taken by the caller. Any
+    invalid manifest, missing dependency blob, or dependency cycle raises DigestConflict
+    before anything is returned, so callers never see a partial graph.
+    """
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+    state: dict[str, int] = {}  # 1 = on the DFS stack, 2 = fully resolved
+
+    def load(digest: str) -> dict[str, Any]:
+        data = blobs.get(digest)
+        if data is None:
+            raise DigestConflict(f"dependency blob {digest} does not exist")
+        return parse_manifest(data)
+
+    # Iterative DFS: each frame is [digest, manifest, sorted dependency names, next index].
+    manifest = load(root)
+    state[root] = 1
+    stack: list[list[Any]] = [[root, manifest, sorted(manifest["dependencies"]), 0]]
+    while stack:
+        frame = stack[-1]
+        digest, manifest, names, index = frame[0], frame[1], frame[2], frame[3]
+        if index == len(names):
+            nodes[digest] = {"digest": digest, "name": manifest["name"], "version": manifest["version"]}
+            state[digest] = 2
+            stack.pop()
+            continue
+        frame[3] = index + 1
+        name = names[index]
+        spec = manifest["dependencies"][name]
+        target = spec["digest"]
+        edges.setdefault((digest, target, name),
+                         {"from": digest, "to": target, "name": name,
+                          "constraint": spec["constraint"]})
+        target_state = state.get(target, 0)
+        if target_state == 1:
+            raise DigestConflict(f"dependency cycle reaches {target}")
+        if target_state == 2:
+            continue
+        target_manifest = load(target)
+        state[target] = 1
+        stack.append([target, target_manifest, sorted(target_manifest["dependencies"]), 0])
+
+    return {
+        "root": root,
+        "nodes": [nodes[digest] for digest in sorted(nodes)],
+        "edges": [edges[key] for key in sorted(edges)],
+    }
+
+
 def _decimal_param(name: str, value: str) -> int:
     if not _DECIMAL.fullmatch(value):
         raise InvalidRequest(f"{name} must be a non-negative decimal integer")
@@ -203,6 +305,21 @@ class Store:
         with self._lock:
             return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
                     "puts": sum(self._refs.values())}
+
+    def graph(self, digest: Any) -> dict[str, Any]:
+        """Dependency graph rooted at a manifest blob, from one consistent read-only snapshot.
+
+        Adds no references and never blocks or triggers reclamation: the snapshot is a
+        shallow copy of the blob table taken under a single lock acquisition, and the
+        traversal runs against it after the lock is released.
+        """
+        if not is_digest(digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if digest not in self._blobs:
+                raise BlobNotFound(f"no blob {digest}")
+            snapshot = dict(self._blobs)
+        return build_graph(digest, snapshot)
 
     def release(self, digest: Any) -> int:
         """Drop one reference to a blob. Content is kept even at refs 0; only gc() reclaims it.
@@ -447,6 +564,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     blobs = [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": refs}
                              for b, refs in items]
                     return self._send(200, {"blobs": blobs, "stats": stats})
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
+                    return self._send(200, store.graph(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     blob = store.head(parts[2])
                     return self._send(200, store.get(parts[2]), blob.media_type)

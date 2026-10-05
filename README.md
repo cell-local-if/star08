@@ -40,8 +40,24 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 `next_cursor`：有后续记录时为本页最后一条 digest，否则为 `null`。`stats` 始终描述全部 blob，不受过滤与分页影响。单次请求基于同一时刻的元数据快照生成完整结果。未知或重复参数、缺失或非法值 ⇒ `400 invalid_request`。
 
-### `DELETE /v1/blobs/{digest}/refs`
-显式释放该 digest 的**一个**引用：
+### `GET /v1/blobs/{digest}/graph`
+把 digest 指向的 blob 当作**依赖清单**解析，并按依赖 digest 递归解析可达清单，导出以该 digest 为根的依赖图。清单本身仍是普通 blob（经 `PUT /v1/blobs` 或上传会话 complete 入库），不增加专用存储、不自动建立引用，去重、refs 与 GC 语义不变。
+
+清单约束（违反任意一条均为 `409 conflict`）：
+
+- 必须是 **UTF-8 JSON 对象**，只允许 `name`、`version`、`dependencies` 三个字段。
+- `name`、`version`：非空字符串，至多 100 字符。
+- `dependencies`：对象，键为依赖名称，值为只允许 `digest`、`constraint` 的对象；`digest` 必填且为 64 位小写十六进制 SHA-256，`constraint` 可选，为至多 200 字符的非空字符串。
+
+成功：`200 {"root","nodes","edges"}`，只含这三个字段：
+
+- `nodes` 按 digest 字典序，节点含 `digest`、`name`、`version`；多条路径到达同一清单时节点只出现一次。
+- `edges` 按 `(from, to, name)` 字典序，边含 `from`、`to`、`name`、`constraint`（清单未写 `constraint` 时为 `null`）；重复边去重。
+- 无依赖时只有根节点且 `edges` 为空。
+
+整次查询基于请求开始时的**一致只读快照**输出完整结果：不增加 refs、不改变回收时机。根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`；根或任一可达清单非法、依赖 blob 不存在、依赖成环 ⇒ `409 conflict`，且**不返回部分图**。
+
+### `DELETE /v1/blobs/{digest}/refs`显式释放该 digest 的**一个**引用：
 
 - 成功：`200 {"digest":..., "refs":<剩余引用数>}`。refs > 1 时只减一；从 1 减到 0 时**内容仍保留**——回收前 GET/HEAD 照常命中，列表中该 blob 显示 `refs: 0`。
 - digest 格式非法 ⇒ `400 invalid_request`；digest 不存在 ⇒ `404 not_found`；refs 已为 0 再释放 ⇒ `409 conflict`（计数不变）。
