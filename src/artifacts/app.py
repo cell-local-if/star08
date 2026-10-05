@@ -61,6 +61,52 @@ def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+MANIFEST_NAME_MAX = 100
+MANIFEST_CONSTRAINT_MAX = 200
+_MANIFEST_KEYS = {"name", "version", "dependencies"}
+_DEPENDENCY_KEYS = {"digest", "constraint"}
+
+
+def parse_manifest(raw: bytes, digest: str) -> dict[str, Any]:
+    """Validate a manifest blob. Any violation is a DigestConflict (409): the blob is
+    stored fine, it just cannot serve as a dependency manifest."""
+    def bad(reason: str) -> DigestConflict:
+        return DigestConflict(f"blob {digest} is not a valid manifest: {reason}")
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise bad("not a UTF-8 JSON object") from error
+    if not isinstance(payload, dict):
+        raise bad("not a UTF-8 JSON object")
+    extra = set(payload) - _MANIFEST_KEYS
+    if extra:
+        raise bad(f"unknown field {sorted(extra)[0]!r}")
+    for key in ("name", "version"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value or len(value) > MANIFEST_NAME_MAX:
+            raise bad(f"{key} must be a non-empty string of at most {MANIFEST_NAME_MAX} characters")
+    dependencies = payload.get("dependencies", {})
+    if not isinstance(dependencies, dict):
+        raise bad("dependencies must be an object")
+    parsed: dict[str, tuple[str, str]] = {}
+    for dep_name, dep in dependencies.items():
+        if not isinstance(dep, dict):
+            raise bad(f"dependency {dep_name!r} must be an object")
+        extra = set(dep) - _DEPENDENCY_KEYS
+        if extra:
+            raise bad(f"dependency {dep_name!r} has unknown field {sorted(extra)[0]!r}")
+        dep_digest = dep.get("digest")
+        if not is_digest(dep_digest):
+            raise bad(f"dependency {dep_name!r} digest must be 64 lowercase hex characters")
+        constraint = dep.get("constraint")
+        if not isinstance(constraint, str) or not constraint or len(constraint) > MANIFEST_CONSTRAINT_MAX:
+            raise bad(f"dependency {dep_name!r} constraint must be a non-empty string "
+                      f"of at most {MANIFEST_CONSTRAINT_MAX} characters")
+        parsed[dep_name] = (dep_digest, constraint)
+    return {"name": payload["name"], "version": payload["version"], "dependencies": parsed}
+
+
 def _decimal_param(name: str, value: str) -> int:
     if not _DECIMAL.fullmatch(value):
         raise InvalidRequest(f"{name} must be a non-negative decimal integer")
@@ -232,6 +278,54 @@ class Store:
             stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
                      "puts": sum(self._refs.values())}
         return {"deleted": deleted, "stats": stats}
+
+    def graph(self, root_digest: Any) -> dict[str, Any]:
+        """Resolve the dependency graph reachable from a root manifest.
+
+        One consistent read-only snapshot taken at request start: no refs change, no
+        reclaim timing changes, and concurrent gc cannot tear the result. The whole
+        graph is validated before anything is returned — errors never yield a partial
+        graph.
+        """
+        if not is_digest(root_digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if root_digest not in self._blobs:
+                raise BlobNotFound(f"no blob {root_digest}")
+            snapshot = dict(self._blobs)
+        nodes: dict[str, dict[str, str]] = {}
+        edges: set[tuple[str, str, str, str]] = set()
+        state: dict[str, str] = {}  # digest -> "visiting" | "done"
+        # Iterative DFS (no recursion-depth limit); each stack entry is (digest, expanded).
+        stack: list[tuple[str, bool]] = [(root_digest, False)]
+        while stack:
+            digest, expanded = stack.pop()
+            if expanded:
+                state[digest] = "done"
+                continue
+            current = state.get(digest)
+            if current == "done":
+                continue
+            if current == "visiting":
+                raise DigestConflict(f"dependency cycle detected at blob {digest}")
+            raw = snapshot.get(digest)
+            if raw is None:
+                raise DigestConflict(f"dependency blob {digest} does not exist")
+            manifest = parse_manifest(raw, digest)
+            state[digest] = "visiting"
+            stack.append((digest, True))
+            nodes[digest] = {"digest": digest, "name": manifest["name"],
+                             "version": manifest["version"]}
+            for dep_name, (dep_digest, constraint) in manifest["dependencies"].items():
+                edges.add((digest, dep_digest, dep_name, constraint))
+                if state.get(dep_digest) != "done":
+                    stack.append((dep_digest, False))
+        return {
+            "root": root_digest,
+            "nodes": [nodes[d] for d in sorted(nodes)],
+            "edges": [{"from": f, "to": t, "name": n, "constraint": c}
+                      for f, t, n, c in sorted(edges)],
+        }
 
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
@@ -450,6 +544,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     blob = store.head(parts[2])
                     return self._send(200, store.get(parts[2]), blob.media_type)
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
+                    return self._send(200, store.graph(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")
