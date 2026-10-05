@@ -6,13 +6,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
+import urllib.parse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 MAX_BLOB = 1_048_576
 DIGEST_LENGTH = 64
+MAX_LIMIT = 100
+_DECIMAL = re.compile(r"[0-9]+")
+_HEX = frozenset("0123456789abcdef")
 
 
 class StoreError(Exception):
@@ -35,11 +40,61 @@ class DigestConflict(StoreError):
 def is_digest(value: Any) -> bool:
     if not isinstance(value, str) or len(value) != DIGEST_LENGTH:
         return False
-    return all(c in "0123456789abcdef" for c in value)
+    return all(c in _HEX for c in value)
+
+
+def is_hex_prefix(value: Any) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= DIGEST_LENGTH:
+        return False
+    return all(c in _HEX for c in value)
 
 
 def digest_of(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _decimal_param(name: str, value: str) -> int:
+    if not _DECIMAL.fullmatch(value):
+        raise InvalidRequest(f"{name} must be a non-negative decimal integer")
+    return int(value)
+
+
+def parse_blob_query(query_string: str) -> dict[str, Any]:
+    """Validate the GET /v1/blobs query string; any violation is an InvalidRequest."""
+    pairs = urllib.parse.parse_qsl(query_string, keep_blank_values=True)
+    names = [name for name, _ in pairs]
+    known = {"digest_prefix", "min_size", "max_size", "min_refs", "limit", "after"}
+    for name in names:
+        if name not in known:
+            raise InvalidRequest(f"unknown query parameter {name!r}")
+    if len(names) != len(set(names)):
+        raise InvalidRequest("query parameters must not repeat")
+    raw = dict(pairs)
+    filters: dict[str, Any] = {}
+    if "digest_prefix" in raw:
+        if not is_hex_prefix(raw["digest_prefix"]):
+            raise InvalidRequest("digest_prefix must be 1 to 64 lowercase hex characters")
+        filters["digest_prefix"] = raw["digest_prefix"]
+    for name in ("min_size", "max_size", "min_refs"):
+        if name in raw:
+            filters[name] = _decimal_param(name, raw[name])
+    for name in ("min_size", "max_size"):
+        if filters.get(name, 0) > MAX_BLOB:
+            raise InvalidRequest(f"{name} must be at most {MAX_BLOB}")
+    if "min_size" in filters and "max_size" in filters and filters["min_size"] > filters["max_size"]:
+        raise InvalidRequest("min_size must not exceed max_size")
+    if "limit" in raw:
+        limit = _decimal_param("limit", raw["limit"])
+        if not 1 <= limit <= MAX_LIMIT:
+            raise InvalidRequest(f"limit must be between 1 and {MAX_LIMIT}")
+        filters["limit"] = limit
+    if "after" in raw:
+        if not is_digest(raw["after"]):
+            raise InvalidRequest("after must be 64 lowercase hex characters")
+        if "limit" not in filters:
+            raise InvalidRequest("after requires limit")
+        filters["after"] = raw["after"]
+    return filters
 
 
 @dataclass(frozen=True)
@@ -103,6 +158,39 @@ class Store:
             return [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": self._refs[b.digest]}
                     for b in sorted(self._meta.values(), key=lambda item: item.digest)]
 
+    def query(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Filtered, paginated listing from one consistent snapshot, ordered by digest."""
+        items, stats = self._snapshot()
+        prefix = filters.get("digest_prefix")
+        if prefix is not None:
+            items = [pair for pair in items if pair[0].digest.startswith(prefix)]
+        if "min_size" in filters:
+            items = [pair for pair in items if pair[0].size >= filters["min_size"]]
+        if "max_size" in filters:
+            items = [pair for pair in items if pair[0].size <= filters["max_size"]]
+        if "min_refs" in filters:
+            items = [pair for pair in items if pair[1] >= filters["min_refs"]]
+        if "after" in filters:
+            items = [pair for pair in items if pair[0].digest > filters["after"]]
+        limit = filters.get("limit")
+        page = items[:limit] if limit is not None else items
+        has_more = limit is not None and len(items) > limit
+        return {
+            "blobs": [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": refs}
+                      for b, refs in page],
+            "next_cursor": page[-1][0].digest if has_more else None,
+            "stats": stats,
+        }
+
+    def _snapshot(self) -> tuple[list[tuple[Blob, int]], dict[str, Any]]:
+        """One lock acquisition: sorted (blob, refs) pairs plus global stats from the same instant."""
+        with self._lock:
+            items = [(b, self._refs[b.digest])
+                     for b in sorted(self._meta.values(), key=lambda item: item.digest)]
+            stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+                     "puts": sum(self._refs.values())}
+        return items, stats
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
@@ -149,7 +237,13 @@ def make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
                 if parts == ["health"]:
                     return self._send(200, {"status": "ok"})
                 if parts == ["v1", "blobs"]:
-                    return self._send(200, {"blobs": store.listing(), "stats": store.stats()})
+                    query_string = urllib.parse.urlsplit(self.path).query
+                    if query_string:
+                        return self._send(200, store.query(parse_blob_query(query_string)))
+                    items, stats = store._snapshot()
+                    blobs = [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": refs}
+                             for b, refs in items]
+                    return self._send(200, {"blobs": blobs, "stats": stats})
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     blob = store.head(parts[2])
                     return self._send(200, store.get(parts[2]), blob.media_type)
