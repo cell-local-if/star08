@@ -204,6 +204,35 @@ class Store:
             return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
                     "puts": sum(self._refs.values())}
 
+    def release(self, digest: Any) -> int:
+        """Drop one reference to a blob. Content is kept even at refs 0; only gc() reclaims it.
+
+        Returns the remaining reference count.
+        """
+        if not is_digest(digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if digest not in self._refs:
+                raise BlobNotFound(f"no blob {digest}")
+            refs = self._refs[digest]
+            if refs == 0:
+                raise DigestConflict(f"blob {digest} has no references left to release")
+            refs -= 1
+            self._refs[digest] = refs
+            return refs
+
+    def gc(self) -> dict[str, Any]:
+        """Atomically delete every blob with refs == 0; blobs still referenced are untouched."""
+        with self._lock:
+            deleted = sorted(d for d, refs in self._refs.items() if refs == 0)
+            for digest in deleted:
+                del self._blobs[digest]
+                del self._meta[digest]
+                del self._refs[digest]
+            stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+                     "puts": sum(self._refs.values())}
+        return {"deleted": deleted, "stats": stats}
+
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
         digest = digest_of(data)
@@ -485,6 +514,12 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
+                if parts == ["v1", "gc"]:
+                    # The body carries no semantics for gc; drain any bytes to keep
+                    # the keep-alive connection usable rather than treating them as an error.
+                    if self.headers.get("Content-Length") is not None:
+                        self._read_body(MAX_BLOB + 1024)
+                    return self._send(200, store.gc())
                 if parts == ["v1", "uploads"]:
                     raw = self._read_body(MAX_BLOB + 1024)
                     size, media_type, declared = UploadManager.parse_create(raw)
@@ -510,6 +545,9 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
         def do_DELETE(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "refs":
+                    refs = store.release(parts[2])
+                    return self._send(200, {"digest": parts[2], "refs": refs})
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")
