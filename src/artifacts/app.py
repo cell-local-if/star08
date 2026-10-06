@@ -117,6 +117,110 @@ def parse_manifest(raw: bytes, digest: str) -> dict[str, Any]:
     return {"name": payload["name"], "version": payload["version"], "dependencies": parsed}
 
 
+_VERSION_SEGMENT = re.compile(r"0|[1-9][0-9]*")
+_ASCII_WHITESPACE = re.compile(r"[ \t\n\r\f\v]+")
+_CONSTRAINT_OPERATORS = (">=", "<=", "=", ">", "<", "^", "~")
+
+# A version interval: (lower, lower_inclusive, upper, upper_inclusive); upper None means unbounded.
+Interval = tuple[tuple[int, int, int], bool, "tuple[int, int, int] | None", bool]
+
+
+def parse_version(text: Any) -> tuple[tuple[int, int, int], int] | None:
+    """Parse a version: 1 to 3 dot-separated decimal segments, no leading zeros except a
+    lone 0. Returns the zero-padded (major, minor, patch) tuple plus the segment count
+    (the count matters for ~V), or None when the syntax is invalid."""
+    if not isinstance(text, str):
+        return None
+    segments = text.split(".")
+    if not 1 <= len(segments) <= 3:
+        return None
+    values = []
+    for segment in segments:
+        if not _VERSION_SEGMENT.fullmatch(segment):
+            return None
+        values.append(int(segment))
+    count = len(values)
+    values.extend([0] * (3 - count))
+    return (values[0], values[1], values[2]), count
+
+
+def _constraint_interval(op: str, version: tuple[int, int, int], segments: int) -> Interval:
+    major, minor, patch = version
+    if op == "=":
+        return (version, True, version, True)
+    if op == ">":
+        return (version, False, None, False)
+    if op == ">=":
+        return (version, True, None, False)
+    if op == "<":
+        return ((0, 0, 0), True, version, False)
+    if op == "<=":
+        return ((0, 0, 0), True, version, True)
+    if op == "^":
+        if major > 0:
+            upper = (major + 1, 0, 0)
+        elif minor > 0:
+            upper = (0, minor + 1, 0)
+        else:
+            upper = (0, 0, patch + 1)
+        return (version, True, upper, False)
+    # op == "~": one segment allows the major to move, two or three pin it.
+    upper = (major + 1, 0, 0) if segments == 1 else (major, minor + 1, 0)
+    return (version, True, upper, False)
+
+
+def parse_constraint(text: str) -> list[Interval] | None:
+    """Parse a constraint string: comparison tokens separated by ASCII whitespace, each
+    one of =V, >V, >=V, <V, <=V, ^V, ~V with V a valid version. Returns one interval per
+    token, or None when any token (or the whole string) is syntactically invalid."""
+    tokens = [token for token in _ASCII_WHITESPACE.split(text) if token]
+    if not tokens:
+        return None
+    intervals = []
+    for token in tokens:
+        for op in _CONSTRAINT_OPERATORS:
+            if token.startswith(op):
+                break
+        else:
+            return None
+        parsed = parse_version(token[len(op):])
+        if parsed is None:
+            return None
+        intervals.append(_constraint_interval(op, *parsed))
+    return intervals
+
+
+def _intervals_intersect(intervals: list[Interval]) -> bool:
+    """True when the intersection of these convex version intervals is non-empty."""
+    lo_v: tuple[int, int, int] | None = None
+    lo_inc = True
+    hi_v: tuple[int, int, int] | None = None
+    hi_inc = True
+    for lv, li, hv, hi in intervals:
+        if lo_v is None or lv > lo_v:
+            lo_v, lo_inc = lv, li
+        elif lv == lo_v:
+            lo_inc = lo_inc and li
+        if hv is not None:
+            if hi_v is None or hv < hi_v:
+                hi_v, hi_inc = hv, hi
+            elif hv == hi_v:
+                hi_inc = hi_inc and hi
+    if lo_v is not None and hi_v is not None:
+        if lo_v > hi_v or (lo_v == hi_v and not (lo_inc and hi_inc)):
+            return False
+    return True
+
+
+def _interval_contains(interval: Interval, version: tuple[int, int, int]) -> bool:
+    lo_v, lo_inc, hi_v, hi_inc = interval
+    if version < lo_v or (version == lo_v and not lo_inc):
+        return False
+    if hi_v is not None and (version > hi_v or (version == hi_v and not hi_inc)):
+        return False
+    return True
+
+
 def _decimal_param(name: str, value: str) -> int:
     if not _DECIMAL.fullmatch(value):
         raise InvalidRequest(f"{name} must be a non-negative decimal integer")
@@ -413,6 +517,86 @@ class Store:
                       for f, t, n, c in sorted(edges)],
         }
 
+    def resolve(self, root_digest: Any) -> dict[str, Any]:
+        """Resolve dependency constraints reachable from a root manifest.
+
+        Same read-only snapshot discipline as graph(): one consistent snapshot taken at
+        request start, no refs change, no reclaim timing change, and errors never yield
+        a partial result. Constraints on the same dependency name are merged and
+        intersected; the target manifest's version must satisfy the intersection.
+        """
+        if not is_digest(root_digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if root_digest not in self._blobs:
+                raise BlobNotFound(f"no blob {root_digest}")
+            snapshot = dict(self._blobs)
+        manifests: dict[str, dict[str, Any]] = {}
+        state: dict[str, str] = {}  # digest -> "visiting" | "done"
+        stack: list[tuple[str, bool]] = [(root_digest, False)]
+        while stack:
+            digest, expanded = stack.pop()
+            if expanded:
+                state[digest] = "done"
+                continue
+            current = state.get(digest)
+            if current == "done":
+                continue
+            if current == "visiting":
+                raise DigestConflict(f"cycle detected at blob {digest}")
+            raw = snapshot.get(digest)
+            if raw is None:
+                raise DigestConflict(f"dependency blob {digest} does not exist")
+            manifest = parse_manifest(raw, digest)
+            state[digest] = "visiting"
+            stack.append((digest, True))
+            manifests[digest] = manifest
+            for dep_digest, _constraint in manifest["dependencies"].values():
+                if state.get(dep_digest) != "done":
+                    stack.append((dep_digest, False))
+        by_name: dict[str, list[tuple[str, str]]] = {}  # name -> [(digest, constraint)]
+        for manifest in manifests.values():
+            for dep_name, (dep_digest, constraint) in manifest["dependencies"].items():
+                by_name.setdefault(dep_name, []).append((dep_digest, constraint))
+        resolved = []
+        for name in sorted(by_name):
+            entries = by_name[name]
+            digests = sorted({dep_digest for dep_digest, _ in entries})
+            if len(digests) > 1:
+                raise DigestConflict(
+                    f"ambiguous_name: dependency {name!r} maps to {len(digests)} different digests")
+            dep_digest = digests[0]
+            target = manifests[dep_digest]
+            if target["name"] != name:
+                raise DigestConflict(
+                    f"name_mismatch: dependency {name!r} resolves to manifest "
+                    f"named {target['name']!r}")
+            parsed_version = parse_version(target["version"])
+            if parsed_version is None:
+                raise DigestConflict(
+                    f"version_syntax: manifest {dep_digest} version "
+                    f"{target['version']!r} is invalid")
+            version = parsed_version[0]
+            constraints = sorted({constraint for _, constraint in entries})
+            intervals: list[Interval] = []
+            for constraint in constraints:
+                parsed_constraint = parse_constraint(constraint)
+                if parsed_constraint is None:
+                    raise DigestConflict(
+                        f"constraint_syntax: constraint {constraint!r} for "
+                        f"dependency {name!r} is invalid")
+                intervals.extend(parsed_constraint)
+            if not _intervals_intersect(intervals):
+                raise DigestConflict(
+                    f"empty_intersection: constraints for dependency {name!r} admit no version")
+            if not all(_interval_contains(interval, version) for interval in intervals):
+                raise DigestConflict(
+                    f"version_mismatch: version {target['version']!r} of dependency {name!r} "
+                    f"is outside the constraint intersection")
+            resolved.append({"name": name, "digest": dep_digest,
+                             "version": target["version"], "constraints": constraints})
+        return {"root": root_digest, "resolved": resolved}
+
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
         digest = digest_of(data)
@@ -678,6 +862,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     return self._get_blob(parts[2])
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
                     return self._send(200, store.graph(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "resolve":
+                    return self._send(200, store.resolve(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")

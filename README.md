@@ -79,6 +79,22 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 错误：根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`；根或任一可达 blob 不是合法清单（非 UTF-8 JSON 对象、字段或值违反上述约束）、依赖 blob 不存在、依赖成环 ⇒ `409 conflict`，且**不返回部分图**。
 
+### `GET /v1/blobs/{digest}/resolve`
+在 graph 的可达清单集合上进一步**裁决版本约束**：以 `{digest}` 为根，在请求开始时的一致只读快照上遍历全部可达清单，按依赖名合并各条边上的 constraint、求交集，并核对该名称对应 digest 的清单版本是否落在交集内。成功不写入任何 blob，不改变 refs、GC 或读取一致性。
+
+**version 语法**：一到三段点分十进制非负整数（如 `1`、`1.2`、`1.2.3`），缺少的段补 0；除单独的 `0` 外禁止前导零。
+
+**constraint 语法**：以 ASCII 空白分隔的若干比较项，每项为 `=V`、`>V`、`>=V`、`<V`、`<=V`、`^V`、`~V` 之一，V 为合法 version，比较使用补齐后的三段数值：
+
+- `^V`：major > 0 时为 `[V, major+1.0.0)`；`0.minor` 且 minor > 0 时为 `[V, 0.minor+1.0)`；`0.0.patch` 时为 `[V, 0.0.patch+1)`。
+- `~V`：V 为一段时为 `[V, major+1.0.0)`；两段或三段时为 `[V, major.minor+1.0)`。
+
+同一依赖名的所有 constraint 取交集，仅当交集非空且包含目标版本时成功。
+
+成功：`200 {"root":<根 digest>, "resolved":[...]}`，**只含这两个字段**。`resolved` 按 name 字典序、同名仅一项，每项 `{"name","digest","version","constraints"}`；`constraints` 为该名称所有边上 constraint 字符串去重并按字典序排列。依赖键必须等于目标清单的 name，且同名只能对应一个 digest。
+
+错误：根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`；清单结构非法或依赖 blob 缺失 ⇒ `409 conflict`（文案同 graph）；依赖成环、version 语法错、constraint 语法错、名称不匹配、同名多个 digest、交集为空、版本不在交集 ⇒ `409 conflict`，message 分别以 `cycle`、`version_syntax`、`constraint_syntax`、`name_mismatch`、`ambiguous_name`、`empty_intersection`、`version_mismatch` 开头，且**不返回部分 resolved**。
+
 ### `POST /v1/gc`
 按需垃圾回收：请求体不参与回收结果。**原子**删除执行时刻 `refs == 0` 的所有 blob，返回 `200 {"deleted": [...], "stats": {"blobs","bytes","puts"}}`：
 
@@ -134,4 +150,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、镜像同步、版本约束求解、审计与可观测性、上传会话跨进程持久化与重启恢复。
+增量去重、签名与信任链、镜像同步、审计与可观测性、上传会话跨进程持久化与重启恢复。

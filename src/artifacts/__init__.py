@@ -17,9 +17,11 @@ from .app import (  # noqa: F401
     digest_of,
     is_digest,
     make_handler,
+    parse_constraint,
     parse_if_range,
     parse_manifest,
     parse_range,
+    parse_version,
     serve,
 )
 
@@ -40,8 +42,10 @@ __all__ = [
     "digest_of",
     "is_digest",
     "make_handler",
+    "parse_constraint",
     "parse_if_range",
     "parse_manifest",
     "parse_range",
+    "parse_version",
     "serve",
 ]
