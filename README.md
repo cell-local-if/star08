@@ -6,10 +6,12 @@
 
 ```bash
 PYTHONPATH=src python3 -m artifacts.app --port 18895
+# 可选：为上传会话启用跨重启持久化
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads-state.json
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；状态在进程内存中。
+Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**。blob、引用计数与垃圾回收状态在进程内存中；上传会话默认也在进程内存中，提供 `--upload-state PATH`（`serve()` 的 `upload_state=` 参数同义）后改为持久化到该文件。
 
 ## 接口
 
@@ -150,7 +152,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 可恢复上传会话
 
-把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。会话仅存于当前进程内存，重启不恢复。
+把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。
+
+未提供 `--upload-state` 时，会话仅存于当前进程内存，重启不恢复（基线行为不变）。提供状态路径后进入**持久化模式**：创建会话、追加分片、放弃（DELETE）、完成（complete）的成功状态都在成功响应之前先原子落盘；用同一路径重启进程后，原 `upload_id` 继续可查，客户端 `GET` 后按 `received` 偏移继续 `PUT` 即可跨进程续传。
+
+- **uncommitted** 会话持久化 `received`、`size`、`media_type`、可选声明 `digest` 以及已收字节本身。
+- **committed** 会话以相同状态与实际 `digest` 恢复；重复 complete 仍为 `409 conflict`。
+- 已删除会话以不可见 **tombstone** 持久化：重启后 GET/PUT/DELETE/complete 一律 `404 not_found`；`upload_id` 跨重启不复用。
+- 持久化**只覆盖上传会话**：complete 写入的 blob 与引用计数仍遵循当前进程内存语义，本次不落盘——重启后 committed 会话可查，但对应 blob 需重新 complete 才回到内容存储。
+- 写盘采用临时文件 + fsync + 原子 rename，崩溃只可能留下上一份或新一份完整文档。状态路径运行中写入失败时，该请求返回 `500 {"error":{"code":"internal_error","message":"upload state write failed"}}`，本次内存变更回滚、不确认；重启后只恢复最近一次成功持久化的状态。
+- 启动时若状态文件**为空、损坏、结构不符或版本不兼容**，服务不监听：进程以非零状态退出，并向标准错误输出 `upload state invalid: <path>`；文件不存在时按空状态初始化。
+- HTTP 状态码、响应字段、分片大小、偏移裁决、摘要校验优先级与并发原子性在两种模式下完全一致。
 
 ### `POST /v1/uploads`
 创建会话，JSON 体：
@@ -194,4 +206,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、镜像同步、审计与可观测性、上传会话跨进程持久化与重启恢复。
+增量去重、签名与信任链、镜像同步、审计与可观测性、blob/引用计数/垃圾回收的跨进程持久化（上传会话持久化已支持，见 `--upload-state`）。
