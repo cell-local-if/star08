@@ -76,6 +76,113 @@ MANIFEST_CONSTRAINT_MAX = 200
 _MANIFEST_KEYS = {"name", "version", "dependencies"}
 _DEPENDENCY_KEYS = {"digest", "constraint"}
 
+# Version/constraint syntax for resolution (GET .../resolve). A version is one to
+# three dot-separated non-negative decimal segments; missing segments count as 0,
+# and leading zeros are banned except for the single value 0.
+_VERSION_SEGMENT = re.compile(r"(0|[1-9][0-9]*)")
+_CONSTRAINT_TOKEN = re.compile(
+    r"(=|>=|<=|>|<|\^|~)(0|[1-9][0-9]*)"
+    r"(?:\.(0|[1-9][0-9]*))?(?:\.(0|[1-9][0-9]*))?")
+_CONSTRAINT_SEPARATOR = re.compile(r"[\t\n\x0b\x0c\r ]+")
+_ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
+_VERSION_FLOOR: tuple[int, int, int] = (0, 0, 0)
+
+Triple = tuple[int, int, int]
+# An interval over integer triples: every v with lower <= v < upper; upper None is +inf.
+Interval = tuple[Triple, Triple | None]
+
+
+class ResolveConflict(DigestConflict):
+    """A 409 surfaced only by resolve: cycle, syntax or version adjudication failure."""
+
+
+def _conflict(prefix: str, detail: str = "") -> ResolveConflict:
+    return ResolveConflict(prefix if not detail else f"{prefix} {detail}")
+
+
+def parse_version(value: str) -> Triple:
+    """Parse a one-to-three segment dotted version into a zero-padded triple.
+
+    Raises ResolveConflict('version_syntax ...') on any syntax violation.
+    """
+    segments = value.split(".")
+    if not 1 <= len(segments) <= 3:
+        raise _conflict("version_syntax", repr(value))
+    numbers: list[int] = []
+    for text in segments:
+        if not _VERSION_SEGMENT.fullmatch(text):
+            raise _conflict("version_syntax", repr(value))
+        numbers.append(int(text))
+    numbers += [0] * (3 - len(numbers))
+    return numbers[0], numbers[1], numbers[2]
+
+
+def parse_constraint_token(token: str) -> tuple[str, Triple, int]:
+    """Parse one operator+version token into (operator, version triple, segment count).
+
+    Raises ResolveConflict('constraint_syntax ...') on any syntax violation.
+    """
+    match = _CONSTRAINT_TOKEN.fullmatch(token)
+    if match is None:
+        raise _conflict("constraint_syntax", repr(token))
+    operator = match.group(1)
+    version = (int(match.group(2)), int(match.group(3) or 0), int(match.group(4) or 0))
+    segment_count = 3 if match.group(4) is not None else (2 if match.group(3) is not None else 1)
+    return operator, version, segment_count
+
+
+def _bump_patch(version: Triple) -> Triple:
+    return version[0], version[1], version[2] + 1
+
+
+def constraint_interval(token: str) -> Interval:
+    """Map one constraint token to an integer-triple interval [lower, upper).
+
+    All comparisons use three-segment numeric triples after zero-padding.
+    ^V allows changes that do not modify the left-most non-zero element of V;
+    ~V pins major (one-segment V) or major.minor (two/three-segment V).
+    """
+    operator, version, segment_count = parse_constraint_token(token)
+    major, minor, patch = version
+    if operator == "=":
+        return version, _bump_patch(version)
+    if operator == ">":
+        return _bump_patch(version), None
+    if operator == ">=":
+        return version, None
+    if operator == "<":
+        return _VERSION_FLOOR, version
+    if operator == "<=":
+        return _VERSION_FLOOR, _bump_patch(version)
+    if operator == "^":
+        if major > 0:
+            return version, (major + 1, 0, 0)
+        if minor > 0:
+            return version, (0, minor + 1, 0)
+        return version, (0, 0, patch + 1)
+    # ~
+    if segment_count == 1:
+        return (major, 0, 0), (major + 1, 0, 0)
+    return version, (major, minor + 1, 0)
+
+
+def intersect_intervals(intervals: list[Interval]) -> Interval:
+    lower = _VERSION_FLOOR
+    upper: Triple | None = None
+    for candidate_lower, candidate_upper in intervals:
+        if candidate_lower > lower:
+            lower = candidate_lower
+        if candidate_upper is not None and (upper is None or candidate_upper < upper):
+            upper = candidate_upper
+    return lower, upper
+
+
+def interval_contains(interval: Interval, version: Triple) -> bool:
+    lower, upper = interval
+    if version < lower:
+        return False
+    return upper is None or version < upper
+
 
 def parse_manifest(raw: bytes, digest: str) -> dict[str, Any]:
     """Validate a manifest blob. Any violation is a DigestConflict (409): the blob is
@@ -413,6 +520,104 @@ class Store:
                       for f, t, n, c in sorted(edges)],
         }
 
+    def resolve(self, root_digest: Any) -> dict[str, Any]:
+        """Adjudicate version constraints over the manifests reachable from a root.
+
+        Like graph(), this runs on one read-only snapshot taken at request start
+        and writes nothing: no refs, GC or consistency effects. Every reachable
+        manifest is first validated exactly as graph() does; the constraints borne
+        by all edges sharing a dependency name are then merged into one interval,
+        and the version of the single digest carrying that name must lie in it.
+        Nothing is returned on failure — errors never yield a partial resolution.
+        """
+        if not is_digest(root_digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if root_digest not in self._blobs:
+                raise BlobNotFound(f"no blob {root_digest}")
+            snapshot = dict(self._blobs)
+        manifests: dict[str, dict[str, Any]] = {}
+        state: dict[str, str] = {}  # digest -> "visiting" | "done"
+        # Same iterative DFS as graph(): identical cycle/missing/structure semantics.
+        stack: list[tuple[str, bool]] = [(root_digest, False)]
+        while stack:
+            digest, expanded = stack.pop()
+            if expanded:
+                state[digest] = "done"
+                continue
+            current = state.get(digest)
+            if current == "done":
+                continue
+            if current == "visiting":
+                raise _conflict("cycle", f"detected at blob {digest}")
+            raw = snapshot.get(digest)
+            if raw is None:
+                raise DigestConflict(f"dependency blob {digest} does not exist")
+            manifest = parse_manifest(raw, digest)
+            state[digest] = "visiting"
+            stack.append((digest, True))
+            manifests[digest] = manifest
+            for dep_name, (dep_digest, _constraint) in manifest["dependencies"].items():
+                if state.get(dep_digest) != "done":
+                    stack.append((dep_digest, False))
+
+        # Merge by dependency name: one digest per name, constraints pooled across edges.
+        targets: dict[str, str] = {}
+        pooled: dict[str, list[str]] = {}
+        for manifest in manifests.values():
+            for dep_name, (dep_digest, constraint_text) in manifest["dependencies"].items():
+                known = targets.get(dep_name)
+                if known is not None and known != dep_digest:
+                    raise _conflict(
+                        "ambiguous_name",
+                        f"dependency {dep_name!r} references more than one digest")
+                targets[dep_name] = dep_digest
+                pooled.setdefault(dep_name, []).append(constraint_text)
+
+        resolved: list[dict[str, Any]] = []
+        for name in sorted(targets):
+            digest = targets[name]
+            target = manifests[digest]
+            if target["name"] != name:
+                raise _conflict(
+                    "name_mismatch",
+                    f"dependency key {name!r} does not match manifest name "
+                    f"{target['name']!r} at blob {digest}")
+            try:
+                version_triple = parse_version(target["version"])
+            except ResolveConflict as error:
+                raise ResolveConflict(
+                    f"{error} for dependency {name!r} at blob {digest}") from error
+            intervals: list[Interval] = []
+            for constraint_text in pooled[name]:
+                text = constraint_text.strip(_ASCII_WHITESPACE)
+                if not text:
+                    raise _conflict(
+                        "constraint_syntax",
+                        f"in dependency {name!r}: {constraint_text!r}")
+                for token in _CONSTRAINT_SEPARATOR.split(text):
+                    try:
+                        intervals.append(constraint_interval(token))
+                    except ResolveConflict as error:
+                        raise ResolveConflict(
+                            f"{error} in dependency {name!r}") from error
+            intersection = intersect_intervals(intervals)
+            lower, upper = intersection
+            if upper is not None and lower >= upper:
+                raise _conflict("empty_intersection", f"for dependency {name!r}")
+            if not interval_contains(intersection, version_triple):
+                raise _conflict(
+                    "version_mismatch",
+                    f"dependency {name!r} version {target['version']} does not satisfy "
+                    f"the merged constraints {sorted(set(pooled[name]))}")
+            resolved.append({
+                "name": name,
+                "digest": digest,
+                "version": target["version"],
+                "constraints": sorted(set(pooled[name])),
+            })
+        return {"root": root_digest, "resolved": resolved}
+
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
         digest = digest_of(data)
@@ -678,6 +883,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     return self._get_blob(parts[2])
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
                     return self._send(200, store.graph(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "resolve":
+                    return self._send(200, store.resolve(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")

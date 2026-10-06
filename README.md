@@ -79,6 +79,33 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 错误：根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`；根或任一可达 blob 不是合法清单（非 UTF-8 JSON 对象、字段或值违反上述约束）、依赖 blob 不存在、依赖成环 ⇒ `409 conflict`，且**不返回部分图**。
 
+### `GET /v1/blobs/{digest}/resolve`
+在与 graph 相同的请求开始时**一致只读快照**上遍历从根清单可达的全部清单，但不止于展开：还按依赖名合并所有边上的版本约束、求交集，并核对承载该名称的唯一清单版本。不写入 blob，不改变 refs、GC 与读取一致性；graph 入口及对其 `constraint`/`version` 的校验均不收紧。
+
+**版本语法**：一到三段以点分隔的十进制非负整数；不足三段右侧补 0 后比较；除单独的 `0` 外禁止前导零（如 `1`、`1.2`、`1.2.0` 等价表示，但 `01`、`1.02` 非法）。
+
+**约束语法**：值以 ASCII 空白（空格、制表、换行、回车、竖向制表、换页）分隔为若干 token；每个 token 仅接受 `=V`、`>V`、`>=V`、`<V`、`<=V`、`^V`、`~V`（`V` 为上述一到三段版本）。比较一律使用补齐后的三段数值：
+
+- `^V`：`major > 0` ⇒ `[V, major+1.0.0)`；`0.minor` 且 `minor > 0` ⇒ `[V, 0.minor+1.0)`；`0.0.patch` ⇒ `[V, 0.0.patch+1)`。
+- `~V`：一段 `V` ⇒ `[V, major+1.0.0)`；两段或三段 `V` ⇒ `[V, major.minor+1.0)`。
+- `=V` 仅含补齐后的 `V` 一点；`>V`/`>=V`/`<V`/`<=V` 按数值半开/闭界常规处理。
+
+同名约束（来自同一名称的所有边，即使分散在菱形依赖的不同路径上）取交集；仅当交集非空**且**目标版本落在交集内才成功。
+
+成功：`200 {"root":<根 digest>, "resolved":[...]}`，**只含这两个字段**：
+
+- `resolved` 按 `name` 字典序排列，每个名称一项；每项 `{"name","digest","version","constraints"}`。
+- 依赖键即目标 `name`：同一名称在整次解析中只允许指向一个 digest。
+- `version` 为目标清单自报的原始版本字符串；`constraints` 为该名称上所有**去重后**的原始 constraint 字符串，按字典序排列（多 token 字符串作为整体参与去重与排序）。
+- 根清单无依赖时 `resolved` 为空数组；根自身的 `version` 不参与裁决。
+
+错误（HTTP 状态与 code 同 graph；以下 message 均以给定前缀开头）：
+
+- 根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`。
+- 清单结构非法、依赖 blob 不存在 ⇒ `409 conflict`，沿用 graph 的 `is not a valid manifest` / `dependency blob ... does not exist` 文案。
+- `409 conflict` 且 message 以 `cycle`、`version_syntax`、`constraint_syntax`、`name_mismatch`、`ambiguous_name`、`empty_intersection`、`version_mismatch` 开头，分别表示：依赖成环；目标清单 `version` 语法错；约束 token 语法错；依赖键与目标清单 `name` 不一致；同名依赖指向多个 digest；同名约束交集为空；交集非空但目标版本不在其中。
+- 任何错误都**不返回部分 resolved**。
+
 ### `POST /v1/gc`
 按需垃圾回收：请求体不参与回收结果。**原子**删除执行时刻 `refs == 0` 的所有 blob，返回 `200 {"deleted": [...], "stats": {"blobs","bytes","puts"}}`：
 
@@ -134,4 +161,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、镜像同步、版本约束求解、审计与可观测性、上传会话跨进程持久化与重启恢复。
+增量去重、签名与信任链、镜像同步、审计与可观测性、上传会话跨进程持久化与重启恢复。
