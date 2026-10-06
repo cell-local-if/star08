@@ -618,6 +618,133 @@ class Store:
             })
         return {"root": root_digest, "resolved": resolved}
 
+    def lock(self, root_digest: Any) -> dict[str, Any]:
+        """Pin the resolution reachable from a root manifest into a reproducible lock.
+
+        Same request-start read-only snapshot, traversal and adjudication as
+        resolve(): identical cycle/missing/structure semantics and identical
+        constraint-intersection and target-version checks (the root's own
+        version is never adjudicated). Nothing is written — no refs, GC or
+        consistency effects — and errors never yield a partial lock.
+
+        The result is fully sorted (packages by name then digest, constraints
+        and dependencies lexicographically), so repeated requests over the same
+        store state produce byte-identical JSON regardless of dict order.
+        """
+        if not is_digest(root_digest):
+            raise InvalidRequest("digest must be 64 lowercase hex characters")
+        with self._lock:
+            if root_digest not in self._blobs:
+                raise BlobNotFound(f"no blob {root_digest}")
+            snapshot = dict(self._blobs)
+        manifests: dict[str, dict[str, Any]] = {}
+        state: dict[str, str] = {}  # digest -> "visiting" | "done"
+        # Same iterative DFS as graph()/resolve(): identical error semantics.
+        stack: list[tuple[str, bool]] = [(root_digest, False)]
+        while stack:
+            digest, expanded = stack.pop()
+            if expanded:
+                state[digest] = "done"
+                continue
+            current = state.get(digest)
+            if current == "done":
+                continue
+            if current == "visiting":
+                raise _conflict("cycle", f"detected at blob {digest}")
+            raw = snapshot.get(digest)
+            if raw is None:
+                raise DigestConflict(f"dependency blob {digest} does not exist")
+            manifest = parse_manifest(raw, digest)
+            state[digest] = "visiting"
+            stack.append((digest, True))
+            manifests[digest] = manifest
+            for dep_name, (dep_digest, _constraint) in manifest["dependencies"].items():
+                if state.get(dep_digest) != "done":
+                    stack.append((dep_digest, False))
+
+        # Merge by dependency name, exactly as resolve(): one digest per name,
+        # constraints pooled across edges, same checks in the same order.
+        targets: dict[str, str] = {}
+        pooled: dict[str, list[str]] = {}
+        for manifest in manifests.values():
+            for dep_name, (dep_digest, constraint_text) in manifest["dependencies"].items():
+                known = targets.get(dep_name)
+                if known is not None and known != dep_digest:
+                    raise _conflict(
+                        "ambiguous_name",
+                        f"dependency {dep_name!r} references more than one digest")
+                targets[dep_name] = dep_digest
+                pooled.setdefault(dep_name, []).append(constraint_text)
+
+        for name in sorted(targets):
+            digest = targets[name]
+            target = manifests[digest]
+            if target["name"] != name:
+                raise _conflict(
+                    "name_mismatch",
+                    f"dependency key {name!r} does not match manifest name "
+                    f"{target['name']!r} at blob {digest}")
+            try:
+                version_triple = parse_version(target["version"])
+            except ResolveConflict as error:
+                raise ResolveConflict(
+                    f"{error} for dependency {name!r} at blob {digest}") from error
+            intervals: list[Interval] = []
+            for constraint_text in pooled[name]:
+                text = constraint_text.strip(_ASCII_WHITESPACE)
+                if not text:
+                    raise _conflict(
+                        "constraint_syntax",
+                        f"in dependency {name!r}: {constraint_text!r}")
+                for token in _CONSTRAINT_SEPARATOR.split(text):
+                    try:
+                        intervals.append(constraint_interval(token))
+                    except ResolveConflict as error:
+                        raise ResolveConflict(
+                            f"{error} in dependency {name!r}") from error
+            intersection = intersect_intervals(intervals)
+            lower, upper = intersection
+            if upper is not None and lower >= upper:
+                raise _conflict("empty_intersection", f"for dependency {name!r}")
+            if not interval_contains(intersection, version_triple):
+                raise _conflict(
+                    "version_mismatch",
+                    f"dependency {name!r} version {target['version']} does not satisfy "
+                    f"the merged constraints {sorted(set(pooled[name]))}")
+
+        # Adjudication passed: name <-> digest is 1:1 among reachable non-root
+        # manifests, so inbound constraints pool per digest exactly as per name.
+        inbound: dict[str, set[str]] = {digest: set() for digest in manifests}
+        for manifest in manifests.values():
+            for _dep_name, (dep_digest, constraint_text) in manifest["dependencies"].items():
+                inbound[dep_digest].add(constraint_text)
+
+        root_manifest = manifests[root_digest]
+        packages: list[dict[str, Any]] = []
+        for digest, manifest in manifests.items():
+            if digest == root_digest:
+                continue
+            dependencies = [
+                {"name": dep_name, "digest": dep_digest, "constraint": constraint_text}
+                for dep_name, (dep_digest, constraint_text)
+                in sorted(manifest["dependencies"].items())
+            ]
+            packages.append({
+                "name": manifest["name"],
+                "version": manifest["version"],
+                "digest": digest,
+                "constraints": sorted(inbound[digest]),
+                "dependencies": dependencies,
+            })
+        packages.sort(key=lambda entry: (entry["name"], entry["digest"]))
+        return {
+            "lock_version": 1,
+            "root": {"name": root_manifest["name"],
+                     "version": root_manifest["version"],
+                     "digest": root_digest},
+            "packages": packages,
+        }
+
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
         digest = digest_of(data)
@@ -885,6 +1012,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     return self._send(200, store.graph(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "resolve":
                     return self._send(200, store.resolve(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "lock":
+                    return self._send(200, store.lock(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")
