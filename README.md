@@ -56,6 +56,23 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 `next_cursor`：有后续记录时为本页最后一条 digest，否则为 `null`。`stats` 始终描述全部 blob，不受过滤与分页影响。单次请求基于同一时刻的元数据快照生成完整结果。未知或重复参数、缺失或非法值 ⇒ `400 invalid_request`。
 
+### `POST /v1/blobs/presence`
+只读批量存在性查询，一次检查一组内容摘要；不改变任何 blob 的字节、media type、refs、stats 或垃圾回收时机。
+
+请求体必须是 **UTF-8 JSON 对象**，且**只允许字段 `digests`**：
+
+- `digests`：数组，含 **1 到 100** 个互不重复的摘要，每项均为 64 位小写十六进制 SHA-256。
+- JSON 非对象、`digests` 缺失、未知字段、数组为空或超过 100、元素类型或格式错误（含大写、长度不符、非十六进制）、摘要重复、请求体不是合法 UTF-8 JSON ⇒ `400 invalid_request`；不允许部分成功，不跳过任何非法摘要。
+- `Content-Length` 缺失、非法、为负或超过上限时，沿用其他 JSON 入口的 `400 invalid_request` 口径（先于体校验）。
+
+成功：`200 {"present":[...], "missing":[...], "stats":{"blobs","bytes","puts"}}`，**只含这三个顶层字段**：
+
+- `present`：仅含请求开始时**已存在**的摘要，按 digest 字典序排列；每项为 `{"digest","size","media_type","refs"}`，语义与 `GET /v1/blobs` 的单条记录完全一致。
+- `missing`：请求开始时**不存在**的摘要，按 digest 字典序排列。摘要不存在是正常结果，不返回 `404`。
+- `stats` 始终描述**请求开始时同一份全部 blob 元数据快照**，`blobs`/`bytes`/`puts` 口径不变，不受请求摘要过滤影响。
+
+该入口只读且并发确定：请求开始时已存在的摘要，即使随后被释放并回收，本次仍报告 `present`；开始时不存在的摘要，即使随后上传成功，本次仍报告 `missing`。相同制品状态下重复调用返回逐字节一致的 JSON。presence 查询不增加引用、不阻止回收。
+
 ### `DELETE /v1/blobs/{digest}/refs`
 显式释放该 digest 的**一个**引用：
 

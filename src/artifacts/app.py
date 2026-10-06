@@ -19,6 +19,8 @@ CHUNK_MAX = 262_144
 UPLOAD_ID_BYTES = 16  # token_hex(16) -> 32 lowercase hex characters
 DIGEST_LENGTH = 64
 MAX_LIMIT = 100
+MAX_PRESENCE = 100
+_PRESENCE_KEYS = {"digests"}
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
 _UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
@@ -268,6 +270,38 @@ def parse_blob_query(query_string: str) -> dict[str, Any]:
     return filters
 
 
+def parse_presence(raw: bytes) -> list[str]:
+    """Validate a POST /v1/blobs/presence body into its ordered list of digests.
+
+    The body must be a UTF-8 JSON object whose only field is `digests`: an array
+    of 1 to MAX_PRESENCE distinct 64-character lowercase hex SHA-256 strings.
+    Any shape violation is an InvalidRequest; nothing is skipped or partially
+    accepted.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InvalidRequest("request body must be a JSON object") from error
+    if not isinstance(payload, dict):
+        raise InvalidRequest("request body must be a JSON object")
+    extra = set(payload) - _PRESENCE_KEYS
+    if extra:
+        raise InvalidRequest(f"unknown field {sorted(extra)[0]!r}")
+    if "digests" not in payload:
+        raise InvalidRequest("digests is required")
+    digests = payload["digests"]
+    if not isinstance(digests, list):
+        raise InvalidRequest("digests must be an array")
+    if not 1 <= len(digests) <= MAX_PRESENCE:
+        raise InvalidRequest(f"digests must contain between 1 and {MAX_PRESENCE} items")
+    for digest in digests:
+        if not is_digest(digest):
+            raise InvalidRequest("each digest must be 64 lowercase hex characters")
+    if len(set(digests)) != len(digests):
+        raise InvalidRequest("digests must not repeat")
+    return digests
+
+
 def parse_range(value: str, size: int) -> tuple[int, int]:
     """Parse a single bytes= range against a blob of `size` bytes into a closed [first, last].
 
@@ -428,6 +462,28 @@ class Store:
             "next_cursor": page[-1][0].digest if has_more else None,
             "stats": stats,
         }
+
+    def presence(self, digests: list[str]) -> dict[str, Any]:
+        """Classify already-validated digests against one request-start snapshot.
+
+        Read-only: no refs are added, no byte, media type or GC timing changes,
+        and the returned stats describe the whole store at the same instant as
+        the present/missing split, so a release+gc or an upload landing during
+        the request cannot change the verdict of any requested digest. Present
+        records and missing digests are each sorted lexicographically.
+        """
+        wanted = set(digests)
+        with self._lock:
+            present = [
+                {"digest": self._meta[d].digest, "size": self._meta[d].size,
+                 "media_type": self._meta[d].media_type, "refs": self._refs[d]}
+                for d in wanted if d in self._meta]
+            stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+                     "puts": sum(self._refs.values())}
+        present.sort(key=lambda item: item["digest"])
+        present_digests = {item["digest"] for item in present}
+        missing = sorted(wanted - present_digests)
+        return {"present": present, "missing": missing, "stats": stats}
 
     def _snapshot(self) -> tuple[list[tuple[Blob, int]], dict[str, Any]]:
         """One lock acquisition: sorted (blob, refs) pairs plus global stats from the same instant."""
@@ -1086,6 +1142,13 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     if self.headers.get("Content-Length") is not None:
                         self._read_body(MAX_BLOB + 1024)
                     return self._send(200, store.gc())
+                if parts == ["v1", "blobs", "presence"]:
+                    # Read-only batch existence check. Content-Length is vetted before
+                    # the body is parsed, matching every other JSON endpoint; the whole
+                    # present/missing split and stats come from one store snapshot.
+                    raw = self._read_body(MAX_BLOB + 1024)
+                    digests = parse_presence(raw)
+                    return self._send(200, store.presence(digests))
                 if parts == ["v1", "uploads"]:
                     raw = self._read_body(MAX_BLOB + 1024)
                     size, media_type, declared = UploadManager.parse_create(raw)
