@@ -6,10 +6,11 @@
 
 ```bash
 PYTHONPATH=src python3 -m artifacts.app --port 18895
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads.json
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；状态在进程内存中。
+Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。
 
 ## 接口
 
@@ -150,7 +151,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 可恢复上传会话
 
-把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。会话仅存于当前进程内存，重启不恢复。
+把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。未提供 `--upload-state` 时会话仅存于当前进程内存，重启不恢复；提供状态路径时按本节末尾的持久化语义跨进程恢复。
 
 ### `POST /v1/uploads`
 创建会话，JSON 体：
@@ -184,6 +185,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 `upload_id` 格式非法（非 32 位小写十六进制）在上述四个动词上一律 `400 invalid_request`；格式合法但未知/已删除 ⇒ `404 not_found`。同一会话的并发写按请求逐个**原子**裁决：恰有一个请求成功，其余得到 `conflict`/`not_found`，不产生重叠、空洞或撕裂字节。
 
+### 持久化模式（`--upload-state PATH`）
+
+- 未提供路径时行为与纯内存模式**完全一致**；提供后，创建会话、追加分片、放弃（DELETE）或完成（complete）的成功状态都**先于成功响应**写入状态文件（临时文件 + fsync + 原子替换整份快照）。
+- 用同一路径重启进程后，原 `upload_id` 继续可用、**不复用**：
+  - **uncommitted** 会话保留已收字节、`received`、`size`、`media_type` 与可选声明 `digest`；客户端 GET 后从 `received` 对应偏移继续 PUT。
+  - **committed** 会话以相同状态与实际 `digest` 查询；重复 complete 仍为 `409 conflict`，写入/删除仍为 `409 conflict`。
+  - **已删除**会话恢复为不可见 tombstone：GET、PUT、DELETE、complete 一律 `404 not_found`。
+- 持久化**只覆盖上传会话**：complete 时写入的 blob 与引用计数仍是进程内存语义，不落盘；重启后 blob 存储为空，committed 会话只保留会话状态与 digest。HTTP 状态码、响应字段、分片大小、偏移裁决、摘要校验与并发原子性均不变。
+- 启动时状态文件**为空、损坏、结构不符或版本不兼容**：服务**不监听**，进程以非零状态退出，标准错误输出一行 `upload state invalid: <path>`；文件不存在等同于尚无会话，正常启动。
+- 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体为 `{"error":{"code":"internal_error","message":"upload state write failed"}}`；该次变更**不确认**并回滚，重启后只恢复最近一次成功持久化的状态。除上述启动与持久化失败结果外，现有校验优先级以及 `400 invalid_request`、`404 not_found`、`409 conflict` 的适用条件不变。
+
 ## 错误语义
 
 ```json
@@ -194,4 +206,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、镜像同步、审计与可观测性、上传会话跨进程持久化与重启恢复。
+增量去重、签名与信任链、镜像同步、审计与可观测性、blob 与引用计数/垃圾回收的跨进程持久化。

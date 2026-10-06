@@ -1,6 +1,18 @@
 """Content-addressed artifact store (baseline service)."""
 
-from .app import (  # noqa: F401
+import warnings
+
+# ``python -m artifacts.app`` imports this package first, and the package imports
+# app, which makes runpy emit a harmless "found in sys.modules ... prior to
+# execution" RuntimeWarning. Silence just that one quirk so CLI diagnostics on
+# stderr are not mixed with unrelated noise.
+warnings.filterwarnings(
+    "ignore",
+    message=r"'artifacts\.app' found in sys\.modules .*",
+    category=RuntimeWarning,
+)
+
+from .app import (  # noqa: E402,F401
     CHUNK_MAX,
     MAX_BLOB,
     Blob,
@@ -15,6 +27,10 @@ from .app import (  # noqa: F401
     UploadManager,
     UploadNotFound,
     UploadSession,
+    UploadState,
+    UploadStateError,
+    UploadStateInvalid,
+    UPLOAD_STATE_VERSION,
     constraint_interval,
     digest_of,
     intersect_intervals,
@@ -41,10 +57,14 @@ __all__ = [
     "ResolveConflict",
     "Store",
     "StoreError",
+    "UPLOAD_STATE_VERSION",
     "UploadConflict",
     "UploadManager",
     "UploadNotFound",
     "UploadSession",
+    "UploadState",
+    "UploadStateError",
+    "UploadStateInvalid",
     "constraint_interval",
     "digest_of",
     "intersect_intervals",

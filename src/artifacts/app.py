@@ -4,10 +4,14 @@ Public contract is README.md. Blobs are addressed by the SHA-256 of their bytes;
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import re
 import secrets
+import sys
+import tempfile
 import threading
 import urllib.parse
 from dataclasses import dataclass, field
@@ -20,6 +24,7 @@ UPLOAD_ID_BYTES = 16  # token_hex(16) -> 32 lowercase hex characters
 DIGEST_LENGTH = 64
 MAX_LIMIT = 100
 PRESENCE_MAX_DIGESTS = 100
+UPLOAD_STATE_VERSION = 1
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
 _UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
@@ -54,6 +59,19 @@ class RangeNotSatisfiable(StoreError):
 
 class UploadConflict(DigestConflict):
     """A resumable upload session is in the wrong state for the requested action."""
+
+
+class UploadStateError(StoreError):
+    """The upload state file cannot be written; the request must not be confirmed."""
+
+    code, status = "internal_error", 500
+
+    def __init__(self) -> None:
+        super().__init__("upload state write failed")
+
+
+class UploadStateInvalid(Exception):
+    """The upload state file is empty, corrupt, structurally wrong or version-incompatible."""
 
 
 def is_digest(value: Any) -> bool:
@@ -842,17 +860,201 @@ class UploadNotFound(StoreError):
     code, status = "not_found", 404
 
 
-class UploadManager:
-    """Process-memory resumable uploads; each append/delete/complete is atomic per session.
+class UploadState:
+    """JSON file backing upload sessions so they survive a process restart.
 
-    Deleted sessions stay in the table as tombstones, so an id is never reissued and a
-    delete is strictly serialized against concurrent writes on the same session lock.
+    The file is rewritten atomically (temp file + fsync + rename) on every
+    confirmed create/append/delete/complete. A failed write never replaces the
+    previously persisted file, so a restart restores only the last successful
+    state. Loading is strictly validated: anything empty, corrupt, structurally
+    wrong or version-incompatible raises UploadStateInvalid so the caller can
+    refuse to start.
     """
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def load(self) -> dict[str, UploadSession]:
+        try:
+            with open(self.path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            # A missing file means "no sessions yet"; any other access problem
+            # surfaces on the first write as a 500.
+            if not os.path.exists(self.path):
+                return {}
+            raise UploadStateInvalid(self.path)
+        if not raw:
+            raise UploadStateInvalid(self.path)
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise UploadStateInvalid(self.path) from None
+        try:
+            return self._parse(doc)
+        except UploadStateInvalid:
+            raise UploadStateInvalid(self.path) from None
+
+    @staticmethod
+    def _invalid() -> UploadStateInvalid:
+        return UploadStateInvalid("")
+
+    @classmethod
+    def _parse(cls, doc: Any) -> dict[str, UploadSession]:
+        error = cls._invalid()
+        if not isinstance(doc, dict):
+            raise error
+        if set(doc) != {"version", "sessions"}:
+            raise error
+        version = doc["version"]
+        if not isinstance(version, int) or isinstance(version, bool) \
+                or version != UPLOAD_STATE_VERSION:
+            raise error
+        entries = doc["sessions"]
+        if not isinstance(entries, list):
+            raise error
+        sessions: dict[str, UploadSession] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise error
+            keys = {"upload_id", "size", "media_type", "declared_digest", "chunks",
+                    "received", "committed", "deleted", "final_digest"}
+            if set(entry) != keys:
+                raise error
+            upload_id = entry["upload_id"]
+            if not isinstance(upload_id, str) or not _UPLOAD_ID.fullmatch(upload_id) \
+                    or upload_id in sessions:
+                raise error
+            size = entry["size"]
+            received = entry["received"]
+            if not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= MAX_BLOB:
+                raise error
+            if not isinstance(received, int) or isinstance(received, bool) \
+                    or not 0 <= received <= size:
+                raise error
+            media_type = entry["media_type"]
+            if not isinstance(media_type, str) or not media_type or len(media_type) > 200:
+                raise error
+            declared = entry["declared_digest"]
+            if declared is not None and not is_digest(declared):
+                raise error
+            final = entry["final_digest"]
+            if final is not None and not is_digest(final):
+                raise error
+            committed = entry["committed"]
+            deleted = entry["deleted"]
+            if not isinstance(committed, bool) or not isinstance(deleted, bool) \
+                    or (committed and deleted):
+                raise error
+            encoded = entry["chunks"]
+            if not isinstance(encoded, list):
+                raise error
+            chunks: list[bytes] = []
+            if committed:
+                # Bytes now live in the (process-memory) blob store; the state
+                # file records only the outcome.
+                if encoded or received != size or final is None:
+                    raise error
+            else:
+                total = 0
+                for piece in encoded:
+                    if not isinstance(piece, str):
+                        raise error
+                    try:
+                        chunk = base64.b64decode(piece, validate=True)
+                    except (ValueError, TypeError) as cause:
+                        raise error from cause
+                    if not chunk or len(chunk) > CHUNK_MAX:
+                        raise error
+                    total += len(chunk)
+                    chunks.append(chunk)
+                if final is not None:
+                    raise error
+                if deleted:
+                    # A tombstone keeps received/size metadata but no bytes.
+                    if chunks:
+                        raise error
+                elif total != received:
+                    raise error
+            session = UploadSession(upload_id, size, media_type, declared)
+            session.chunks = chunks
+            session.received = received
+            session.committed = committed
+            session.deleted = deleted
+            session.final_digest = final
+            sessions[upload_id] = session
+        return sessions
+
+    def save(self, sessions: dict[str, UploadSession]) -> None:
+        """Atomically persist a snapshot of every live/tombstoned session.
+
+        Write failure (unwritable path, I/O error at any stage) is surfaced as
+        UploadStateError; the pre-existing state file is left untouched.
+        """
+        entries: list[dict[str, Any]] = []
+        for upload_id in sorted(sessions):
+            session = sessions[upload_id]
+            entries.append({
+                "upload_id": session.upload_id,
+                "size": session.size,
+                "media_type": session.media_type,
+                "declared_digest": session.declared_digest,
+                "chunks": [base64.b64encode(chunk).decode("ascii") for chunk in session.chunks],
+                "received": session.received,
+                "committed": session.committed,
+                "deleted": session.deleted,
+                "final_digest": session.final_digest,
+            })
+        payload = json.dumps({"version": UPLOAD_STATE_VERSION, "sessions": entries},
+                             ensure_ascii=False).encode("utf-8")
+        directory = os.path.dirname(os.path.abspath(self.path))
+        try:
+            handle, tmp_name = tempfile.mkstemp(dir=directory, prefix=".upload-state-")
+            try:
+                with os.fdopen(handle, "wb") as tmp:
+                    tmp.write(payload)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(tmp_name, self.path)
+                # Best-effort directory fsync so the rename itself is durable; on
+                # filesystems that reject fsync on a directory the rename above
+                # has already landed, so this must not turn into a failed write.
+                try:
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+                raise
+        except OSError as error:
+            raise UploadStateError() from error
+
+
+class UploadManager:
+    """Resumable uploads; each append/delete/complete is atomic per session.
+
+    Deleted sessions stay in the table as tombstones, so an id is never reissued
+    and a delete is strictly serialized against concurrent writes on the same
+    session lock. When an UploadState is configured, every confirmed
+    create/append/delete/complete is persisted (under a global persist lock so
+    full-snapshot writes never interleave) before success is returned; a failed
+    write rolls the in-process change back and surfaces as a 500.
+    """
+
+    def __init__(self, store: Store, state: UploadState | None = None,
+                 sessions: dict[str, UploadSession] | None = None) -> None:
         self._store = store
         self._lock = threading.Lock()
-        self._sessions: dict[str, UploadSession] = {}
+        self._persist_lock = threading.Lock()
+        self._state = state
+        self._sessions: dict[str, UploadSession] = sessions if sessions is not None else {}
 
     @staticmethod
     def parse_create(raw: bytes) -> tuple[int, str, str | None]:
@@ -884,6 +1086,25 @@ class UploadManager:
         return size, media_type, declared
 
     def create(self, size: int, media_type: str, declared_digest: str | None) -> UploadSession:
+        if self._state is not None:
+            # persist_lock is taken before the table mutation so the persisted
+            # snapshot always includes this session; id generation happens under
+            # the table lock as before.
+            with self._persist_lock:
+                with self._lock:
+                    while True:
+                        upload_id = secrets.token_hex(UPLOAD_ID_BYTES)
+                        if upload_id not in self._sessions:
+                            break
+                    session = UploadSession(upload_id, size, media_type, declared_digest)
+                    self._sessions[upload_id] = session
+                try:
+                    self._state.save(self._sessions)
+                except UploadStateError:
+                    with self._lock:
+                        del self._sessions[upload_id]
+                    raise
+                return session
         with self._lock:
             while True:
                 upload_id = secrets.token_hex(UPLOAD_ID_BYTES)
@@ -918,6 +1139,22 @@ class UploadManager:
         if len(chunk) > CHUNK_MAX:
             raise InvalidRequest(f"chunk must be at most {CHUNK_MAX} bytes")
         session = self._live(upload_id)
+        if self._state is not None:
+            with self._persist_lock:
+                with session.lock:
+                    self._guard_live(session, upload_id)
+                    self._check_append(session, upload_id, offset, chunk)
+                    session.chunks.append(chunk)
+                    session.received += len(chunk)
+                    try:
+                        self._state.save(self._sessions)
+                    except UploadStateError:
+                        # The change is not confirmed: roll back so the session
+                        # and the last successful state file agree.
+                        session.chunks.pop()
+                        session.received -= len(chunk)
+                        raise
+                    return session
         with session.lock:
             # A concurrent delete (serialized on this same lock) may have tombstoned it.
             if session.deleted:
@@ -932,8 +1169,38 @@ class UploadManager:
             session.received += len(chunk)
             return session
 
+    @staticmethod
+    def _guard_live(session: UploadSession, upload_id: str) -> None:
+        if session.deleted:
+            raise UploadNotFound(f"no upload session {upload_id}")
+
+    @staticmethod
+    def _check_append(session: UploadSession, upload_id: str, offset: int, chunk: bytes) -> None:
+        if session.committed:
+            raise UploadConflict("upload session is already committed")
+        if offset != session.received:
+            raise UploadConflict(f"offset {offset} does not match received {session.received}")
+        if session.received + len(chunk) > session.size:
+            raise UploadConflict("chunk would exceed the declared size")
+
     def delete(self, upload_id: str) -> None:
         session = self._live(upload_id)
+        if self._state is not None:
+            with self._persist_lock:
+                with session.lock:
+                    if session.committed:
+                        raise UploadConflict("upload session is already committed")
+                    previous_chunks = session.chunks
+                    # 204 wins exactly once: the id stays in the table as an invisible tombstone.
+                    session.deleted = True
+                    session.chunks = []
+                    try:
+                        self._state.save(self._sessions)
+                    except UploadStateError:
+                        session.deleted = False
+                        session.chunks = previous_chunks
+                        raise
+                return
         with session.lock:
             if session.committed:
                 raise UploadConflict("upload session is already committed")
@@ -943,6 +1210,39 @@ class UploadManager:
 
     def complete(self, upload_id: str) -> tuple[UploadSession, Blob]:
         session = self._live(upload_id)
+        if self._state is not None:
+            with self._persist_lock:
+                with session.lock:
+                    self._guard_live(session, upload_id)
+                    if session.committed:
+                        raise UploadConflict("upload session is already committed")
+                    if session.received != session.size:
+                        raise UploadConflict(
+                            f"received {session.received} of {session.size} bytes; cannot complete")
+                    data = b"".join(session.chunks)
+                    digest = digest_of(data)
+                    # Verify the declared digest (409) before any state change: no
+                    # persisted commit, no blob, the session stays resumable.
+                    if session.declared_digest is not None and session.declared_digest != digest:
+                        raise DigestConflict(
+                            f"declared {session.declared_digest} does not match computed {digest}")
+                    previous_chunks = session.chunks
+                    session.committed = True
+                    session.final_digest = digest
+                    session.chunks = []
+                    try:
+                        self._state.save(self._sessions)
+                    except UploadStateError:
+                        # Commit not confirmed: roll the session back; nothing was stored.
+                        session.committed = False
+                        session.final_digest = None
+                        session.chunks = previous_chunks
+                        raise
+                    # Persistence is confirmed; only now does the process-memory
+                    # blob store gain the blob/reference.
+                    blob = self._store.put_completed(data, session.declared_digest,
+                                                     session.media_type)
+                return session, blob
         with session.lock:
             if session.deleted:
                 raise UploadNotFound(f"no upload session {upload_id}")
@@ -1186,9 +1486,16 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
     return Handler
 
 
-def serve(host: str = "127.0.0.1", port: int = 18895) -> ThreadingHTTPServer:
+def serve(host: str = "127.0.0.1", port: int = 18895,
+          upload_state: str | None = None) -> ThreadingHTTPServer:
     store = Store()
-    uploads = UploadManager(store)
+    state: UploadState | None = None
+    sessions: dict[str, UploadSession] | None = None
+    if upload_state is not None:
+        state = UploadState(upload_state)
+        # Refuse to listen on an empty/corrupt/structurally wrong/incompatible file.
+        sessions = state.load()
+    uploads = UploadManager(store, state, sessions)
     httpd = ThreadingHTTPServer((host, port), make_handler(store, uploads))
     httpd.store = store  # type: ignore[attr-defined]
     httpd.uploads = uploads  # type: ignore[attr-defined]
@@ -1201,7 +1508,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="content-addressed artifact store")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18895)
+    parser.add_argument("--upload-state", default=None,
+                        help="path to the upload session state file (resumable across restarts)")
     args = parser.parse_args()
-    server = serve(args.host, args.port)
+    try:
+        server = serve(args.host, args.port, args.upload_state)
+    except UploadStateInvalid as error:
+        print(f"upload state invalid: {error}", file=sys.stderr)
+        sys.exit(1)
     print(f"artifact store listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
