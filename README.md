@@ -106,6 +106,22 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 - `409 conflict` 且 message 以 `cycle`、`version_syntax`、`constraint_syntax`、`name_mismatch`、`ambiguous_name`、`empty_intersection`、`version_mismatch` 开头，分别表示：依赖成环；目标清单 `version` 语法错；约束 token 语法错；依赖键与目标清单 `name` 不一致；同名依赖指向多个 digest；同名约束交集为空；交集非空但目标版本不在其中。
 - 任何错误都**不返回部分 resolved**。
 
+### `GET /v1/blobs/{digest}/lock`
+在与 resolve 相同的请求开始时**一致只读快照**上，把 `{digest}` 为根、沿 `dependencies` 可达的全部清单固定为一份可复现的锁定结果。沿用现有清单、版本与约束语义：约束交集与目标版本校验和 resolve 完全一致，根清单自身的 `version` 不参与裁决；不写入 blob，不改变 refs、stats、GC 与读取一致性，graph/resolve 等现有入口行为不变。
+
+成功：`200`，UTF-8 JSON，顶层依次只含 `lock_version`、`root`、`packages`：
+
+- `lock_version` 固定为 `1`。
+- `root` 依次为 `{"name","version","digest"}`，取根清单的原始字符串与根 digest。
+- `packages` **不含根**；每个可达清单恰好出现一次，按 `name` 再按 `digest` 的字典序排列。每项依次含：
+  - `name` / `version` / `digest`：清单自报的原始字符串与其 digest。
+  - `constraints`：该清单**所有入边**的约束，按完整字符串去重并按字典序排序——不拆 token、不改写空白或版本拼写。
+  - `dependencies`：该清单自身的依赖，按依赖名排序；每项依次 `{"name","digest","constraint"}`，`constraint` 保留清单中的原字符串。
+
+相同制品状态下重复请求返回**逐字节一致**的 JSON（全部排序显式完成，不依赖字典遍历顺序）。
+
+错误（HTTP 状态与 code 同 resolve，message 前缀一致）：根 digest 格式非法 ⇒ `400 invalid_request`；根 blob 不存在 ⇒ `404 not_found`；清单结构非法、依赖 blob 不存在，以及 `cycle`、`version_syntax`、`constraint_syntax`、`name_mismatch`、`ambiguous_name`、`empty_intersection`、`version_mismatch` ⇒ `409 conflict`。任何错误都**不返回部分 lock**。
+
 ### `POST /v1/gc`
 按需垃圾回收：请求体不参与回收结果。**原子**删除执行时刻 `refs == 0` 的所有 blob，返回 `200 {"deleted": [...], "stats": {"blobs","bytes","puts"}}`：
 

@@ -520,15 +520,20 @@ class Store:
                       for f, t, n, c in sorted(edges)],
         }
 
-    def resolve(self, root_digest: Any) -> dict[str, Any]:
-        """Adjudicate version constraints over the manifests reachable from a root.
+    def _closure(self, root_digest: Any) -> tuple[dict[str, dict[str, Any]],
+                                                  dict[str, str],
+                                                  dict[str, list[str]]]:
+        """Traverse and adjudicate the manifests reachable from a root digest.
 
-        Like graph(), this runs on one read-only snapshot taken at request start
-        and writes nothing: no refs, GC or consistency effects. Every reachable
-        manifest is first validated exactly as graph() does; the constraints borne
-        by all edges sharing a dependency name are then merged into one interval,
-        and the version of the single digest carrying that name must lie in it.
-        Nothing is returned on failure — errors never yield a partial resolution.
+        Shared by resolve() and lock(). Runs on one read-only snapshot taken at
+        request start and writes nothing: no refs, GC or consistency effects.
+        Every reachable manifest is validated exactly as graph() does; the
+        constraints borne by all edges sharing a dependency name are merged into
+        one interval, and the version of the single digest carrying that name
+        must lie in it. Returns (manifests, targets, pooled): manifests keyed by
+        digest, targets mapping each dependency name to its digest, and pooled
+        mapping each name to the raw constraint strings on its edges. Any failure
+        raises before returning — callers never emit partial results.
         """
         if not is_digest(root_digest):
             raise InvalidRequest("digest must be 64 lowercase hex characters")
@@ -574,7 +579,6 @@ class Store:
                 targets[dep_name] = dep_digest
                 pooled.setdefault(dep_name, []).append(constraint_text)
 
-        resolved: list[dict[str, Any]] = []
         for name in sorted(targets):
             digest = targets[name]
             target = manifests[digest]
@@ -610,13 +614,65 @@ class Store:
                     "version_mismatch",
                     f"dependency {name!r} version {target['version']} does not satisfy "
                     f"the merged constraints {sorted(set(pooled[name]))}")
-            resolved.append({
-                "name": name,
-                "digest": digest,
-                "version": target["version"],
-                "constraints": sorted(set(pooled[name])),
-            })
+        return manifests, targets, pooled
+
+    def resolve(self, root_digest: Any) -> dict[str, Any]:
+        """Adjudicate version constraints over the manifests reachable from a root.
+
+        Like graph(), this runs on one read-only snapshot taken at request start
+        and writes nothing: no refs, GC or consistency effects. Every reachable
+        manifest is first validated exactly as graph() does; the constraints borne
+        by all edges sharing a dependency name are then merged into one interval,
+        and the version of the single digest carrying that name must lie in it.
+        Nothing is returned on failure — errors never yield a partial resolution.
+        """
+        manifests, targets, pooled = self._closure(root_digest)
+        resolved = [{
+            "name": name,
+            "digest": targets[name],
+            "version": manifests[targets[name]]["version"],
+            "constraints": sorted(set(pooled[name])),
+        } for name in sorted(targets)]
         return {"root": root_digest, "resolved": resolved}
+
+    def lock(self, root_digest: Any) -> dict[str, Any]:
+        """Pin the reachable dependency closure into one reproducible lock result.
+
+        Same snapshot, validation and adjudication as resolve() — the root's own
+        version is not adjudicated, and any conflict fails the whole lock with no
+        partial output. The result is fully sorted (packages by name then digest,
+        constraints and dependencies deterministically ordered), so repeated
+        requests over unchanged content return byte-identical JSON.
+        """
+        manifests, _targets, _pooled = self._closure(root_digest)
+        # Inbound constraints per digest: every edge pointing at a manifest
+        # contributes its raw constraint string, deduplicated and sorted whole.
+        inbound: dict[str, set[str]] = {}
+        for manifest in manifests.values():
+            for _name, (dep_digest, constraint_text) in manifest["dependencies"].items():
+                inbound.setdefault(dep_digest, set()).add(constraint_text)
+        packages = []
+        for digest, manifest in manifests.items():
+            if digest == root_digest:
+                continue
+            packages.append({
+                "name": manifest["name"],
+                "version": manifest["version"],
+                "digest": digest,
+                "constraints": sorted(inbound.get(digest, ())),
+                "dependencies": [
+                    {"name": dep_name, "digest": dep_digest, "constraint": constraint}
+                    for dep_name, (dep_digest, constraint)
+                    in sorted(manifest["dependencies"].items())
+                ],
+            })
+        packages.sort(key=lambda package: (package["name"], package["digest"]))
+        root = manifests[root_digest]
+        return {
+            "lock_version": 1,
+            "root": {"name": root["name"], "version": root["version"], "digest": root_digest},
+            "packages": packages,
+        }
 
     def put_completed(self, data: bytes, declared_digest: str | None, media_type: str) -> Blob:
         """Commit a finished upload session: verify digest, then dedupe/ref-count like a plain PUT."""
@@ -885,6 +941,8 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     return self._send(200, store.graph(parts[2]))
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "resolve":
                     return self._send(200, store.resolve(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "lock":
+                    return self._send(200, store.lock(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["v1", "uploads"]:
                     if not _UPLOAD_ID.fullmatch(parts[2]):
                         raise InvalidRequest("upload_id must be 32 lowercase hex characters")
