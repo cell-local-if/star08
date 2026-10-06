@@ -19,6 +19,7 @@ CHUNK_MAX = 262_144
 UPLOAD_ID_BYTES = 16  # token_hex(16) -> 32 lowercase hex characters
 DIGEST_LENGTH = 64
 MAX_LIMIT = 100
+PRESENCE_MAX_DIGESTS = 100
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
 _UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
@@ -268,6 +269,38 @@ def parse_blob_query(query_string: str) -> dict[str, Any]:
     return filters
 
 
+def parse_presence(raw: bytes) -> list[str]:
+    """Validate a POST /v1/blobs/presence body into its list of unique digests.
+
+    Must be a UTF-8 JSON object with exactly one field, ``digests``: an array of
+    1..PRESENCE_MAX_DIGESTS distinct 64-character lowercase hex SHA-256 strings.
+    Every shape violation is an InvalidRequest — nothing is filtered or skipped.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InvalidRequest("request body must be a UTF-8 JSON object") from error
+    if not isinstance(payload, dict):
+        raise InvalidRequest("request body must be a JSON object")
+    if "digests" not in payload:
+        raise InvalidRequest("digests is required")
+    extra = set(payload) - {"digests"}
+    if extra:
+        raise InvalidRequest(f"unknown field {sorted(extra)[0]!r}")
+    digests = payload["digests"]
+    if not isinstance(digests, list):
+        raise InvalidRequest("digests must be an array")
+    if not 1 <= len(digests) <= PRESENCE_MAX_DIGESTS:
+        raise InvalidRequest(
+            f"digests must contain between 1 and {PRESENCE_MAX_DIGESTS} entries")
+    for digest in digests:
+        if not is_digest(digest):
+            raise InvalidRequest("each digest must be 64 lowercase hex characters")
+    if len(set(digests)) != len(digests):
+        raise InvalidRequest("digests must not repeat")
+    return digests
+
+
 def parse_range(value: str, size: int) -> tuple[int, int]:
     """Parse a single bytes= range against a blob of `size` bytes into a closed [first, last].
 
@@ -442,6 +475,24 @@ class Store:
         with self._lock:
             return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
                     "puts": sum(self._refs.values())}
+
+    def presence(self, digests: list[str]) -> dict[str, Any]:
+        """Read-only batch existence check on one request-start snapshot.
+
+        One lock acquisition yields the full sorted metadata snapshot and the
+        global stats, exactly like query(), so presence/missing membership and
+        stats always describe the same instant. Nothing is written: no refs are
+        added and GC timing is unaffected. `digests` is assumed pre-validated by
+        parse_presence(); requested-but-absent digests are `missing`, never 404.
+        """
+        items, stats = self._snapshot()
+        requested = set(digests)
+        present = [{"digest": blob.digest, "size": blob.size,
+                    "media_type": blob.media_type, "refs": refs}
+                   for blob, refs in items if blob.digest in requested]
+        present_digests = {entry["digest"] for entry in present}
+        missing = sorted(requested - present_digests)
+        return {"present": present, "missing": missing, "stats": stats}
 
     def release(self, digest: Any) -> int:
         """Drop one reference to a blob. Content is kept even at refs 0; only gc() reclaims it.
@@ -1080,6 +1131,10 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
+                if parts == ["v1", "blobs", "presence"]:
+                    raw = self._read_body(MAX_BLOB + 1024)
+                    digests = parse_presence(raw)
+                    return self._send(200, store.presence(digests))
                 if parts == ["v1", "gc"]:
                     # The body carries no semantics for gc; drain any bytes to keep
                     # the keep-alive connection usable rather than treating them as an error.
