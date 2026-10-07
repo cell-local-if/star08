@@ -149,6 +149,26 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 同一 digest 上并发的 PUT、上传会话 complete、释放与回收按请求逐个原子裁决，不丢失引用更新：无论交错顺序，最终 refs 等于尚未释放的写入次数。回收只在调用 `POST /v1/gc` 时发生，不自动定时执行。
 
+### `POST /v1/mirror/pull`
+把一批摘要从一个**同契约远端实例**同步到本地。远端调用只读（一次 presence、若干 GET），不发送任何凭证。
+
+请求体必须是 **UTF-8 JSON 对象**，只允许以下两个字段（均必填）：
+
+- `base_url`：远端站点根地址，`http` 或 `https`，不带用户信息、查询或片段（路径为空或 `/`）。
+- `digests`：数组，包含 **1 到 100** 个**互不重复**的 64 位小写十六进制 SHA-256。
+
+流程：按 digest 字典序向远端 `POST /v1/blobs/presence`；其响应的 `present` 与 `missing` 必须各自按 digest 排序且并集恰好覆盖本次请求。随后对**提交时本地没有**且远端存在的摘要逐个 `GET /v1/blobs/{digest}`，只接受 `200` 原始字节：`X-Blob-Digest` 必须等于请求的摘要，实际 SHA-256 必须匹配，大小为 1–1048576 字节；`Content-Type` 缺失或为空记作 `application/octet-stream`，非空不得超过 200 字符。提交时本地已有的项归入 `existing`，**不读取远端字节、不改 refs**。
+
+**全部待拉取响应验证通过后才原子入库**：新 blob `refs = 1`；同一批中已有的 blob 保持不变（重试不为 `existing` 增加引用）。任何一步失败都**不部分入库**。
+
+成功：`200`，只含三个顶层字段，均按 digest 字典序且互斥，并集等于请求的 `digests`：
+
+- `synced`：本次新入库的摘要。
+- `existing`：提交时本地已有的摘要。
+- `missing`：本地和远端都没有的摘要。
+
+错误：请求形状、`base_url` 或摘要非法 ⇒ `400 invalid_request`；远端连接失败、presence 形状或覆盖错误、GET 非 200、摘要头或哈希不符、大小越界、媒体类型非法 ⇒ `502 {"error":{"code":"mirror_error","message":"remote sync failed"}}`。未知路径仍返回 `404`。并发本地写入继续遵守去重、refs、gc、上传状态与读取快照的既有原子语义。
+
 ## 可恢复上传会话
 
 把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。未提供 `--upload-state` 时会话仅存于当前进程内存，重启不恢复；提供状态路径时按本节末尾的持久化语义跨进程恢复。
@@ -199,11 +219,11 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|conflict|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|conflict|mirror_error|internal_error", "message": "<可读说明>"}}
 ```
 
 优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `conflict`（如分片本身非法先于 offset 冲突，`upload_id` 格式非法先于会话查找）。
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、镜像同步、审计与可观测性、blob 与引用计数/垃圾回收的跨进程持久化。
+增量去重、签名与信任链、审计与可观测性、blob 与引用计数/垃圾回收的跨进程持久化。
