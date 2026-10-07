@@ -49,6 +49,15 @@ class DigestConflict(StoreError):
     code, status = "conflict", 409
 
 
+class QuotaExceeded(StoreError):
+    """A write would push the total stored bytes past the configured service quota."""
+
+    code, status = "quota_exceeded", 413
+
+    def __init__(self) -> None:
+        super().__init__("store byte quota exceeded")
+
+
 class RangeNotSatisfiable(StoreError):
     """A syntactically valid Range that cannot intersect the blob."""
 
@@ -463,13 +472,54 @@ class Blob:
 
 
 class Store:
-    """In-memory, deduplicated by digest. `put` returns the blob metadata; repeats are no-ops."""
+    """In-memory, deduplicated by digest. `put` returns the blob metadata; repeats are no-ops.
 
-    def __init__(self) -> None:
+    With `max_store_bytes` (a positive integer) the store enforces a service-level
+    quota on the total raw bytes held across distinct digests: repeats of an
+    already-stored digest only add a reference and never count again, and a blob
+    at refs 0 still occupies quota until gc() reclaims it. Every write path
+    checks the quota atomically with its commit, so a successful commit never
+    leaves the store over the cap. Without the argument there is no cap.
+    """
+
+    def __init__(self, max_store_bytes: int | None = None) -> None:
+        if max_store_bytes is not None and (
+                not isinstance(max_store_bytes, int) or isinstance(max_store_bytes, bool)
+                or max_store_bytes < 1):
+            raise ValueError("max_store_bytes must be a positive integer")
         self._lock = threading.RLock()
         self._blobs: dict[str, bytes] = {}
         self._meta: dict[str, Blob] = {}
         self._refs: dict[str, int] = {}
+        self._max_store_bytes = max_store_bytes
+
+    def _stored_bytes(self) -> int:
+        """Total raw bytes held right now. Caller must hold the lock."""
+        return sum(len(v) for v in self._blobs.values())
+
+    def _quota_check(self, additional: int) -> None:
+        """Raise QuotaExceeded if storing `additional` new bytes would exceed the cap.
+
+        Caller must hold the lock; only bytes for digests not yet stored count.
+        """
+        if self._max_store_bytes is not None \
+                and self._stored_bytes() + additional > self._max_store_bytes:
+            raise QuotaExceeded()
+
+    def atomic_commit(self) -> threading.RLock:
+        """Serialize a multi-step commit (quota check ... insert) against other writers."""
+        return self._lock
+
+    def check_new_blob_quota(self, digest: str, nbytes: int) -> None:
+        """Raise QuotaExceeded if storing `nbytes` for `digest` would exceed the cap.
+
+        A no-op when the digest is already stored (a repeat only adds a reference)
+        or when no quota is configured. Atomic only while the caller holds
+        atomic_commit().
+        """
+        with self._lock:
+            if digest not in self._blobs:
+                self._quota_check(nbytes)
 
     def put(self, data: Any, declared_digest: Any = None, media_type: Any = None) -> Blob:
         if not isinstance(data, (bytes, bytearray)):
@@ -490,6 +540,7 @@ class Store:
             if digest in self._blobs:
                 self._refs[digest] += 1
             else:
+                self._quota_check(len(raw))
                 self._blobs[digest] = raw
                 self._meta[digest] = Blob(digest, len(raw), media_type or "application/octet-stream")
                 self._refs[digest] = 1
@@ -559,13 +610,13 @@ class Store:
         with self._lock:
             items = [(b, self._refs[b.digest])
                      for b in sorted(self._meta.values(), key=lambda item: item.digest)]
-            stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+            stats = {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
                      "puts": sum(self._refs.values())}
         return items, stats
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+            return {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
                     "puts": sum(self._refs.values())}
 
     def presence(self, digests: list[str]) -> dict[str, Any]:
@@ -607,6 +658,11 @@ class Store:
         existing: list[str] = []
         missing: list[str] = []
         with self._lock:
+            # All-or-nothing, quota included: the bytes every genuinely new digest
+            # would add are checked in one sum before anything is inserted, so a
+            # quota breach stores no part of the batch.
+            self._quota_check(sum(len(incoming[digest][0]) for digest in digests
+                                  if digest not in self._blobs and digest in incoming))
             for digest in digests:
                 if digest in self._blobs:
                     existing.append(digest)
@@ -645,7 +701,7 @@ class Store:
                 del self._blobs[digest]
                 del self._meta[digest]
                 del self._refs[digest]
-            stats = {"blobs": len(self._blobs), "bytes": sum(len(v) for v in self._blobs.values()),
+            stats = {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
                      "puts": sum(self._refs.values())}
         return {"deleted": deleted, "stats": stats}
 
@@ -931,6 +987,7 @@ class Store:
             if digest in self._blobs:
                 self._refs[digest] += 1
             else:
+                self._quota_check(len(data))
                 self._blobs[digest] = data
                 self._meta[digest] = Blob(digest, len(data), media_type)
                 self._refs[digest] = 1
@@ -1442,22 +1499,28 @@ class UploadManager:
                     if session.declared_digest is not None and session.declared_digest != digest:
                         raise DigestConflict(
                             f"declared {session.declared_digest} does not match computed {digest}")
-                    previous_chunks = session.chunks
-                    session.committed = True
-                    session.final_digest = digest
-                    session.chunks = []
-                    try:
-                        self._state.save(self._sessions)
-                    except UploadStateError:
-                        # Commit not confirmed: roll the session back; nothing was stored.
-                        session.committed = False
-                        session.final_digest = None
-                        session.chunks = previous_chunks
-                        raise
-                    # Persistence is confirmed; only now does the process-memory
-                    # blob store gain the blob/reference.
-                    blob = self._store.put_completed(data, session.declared_digest,
-                                                     session.media_type)
+                    # The store lock is held from the quota check through the
+                    # insert so the check and the commit are one atomic step: a
+                    # 413 leaves the session uncommitted and nothing persisted,
+                    # and no concurrent writer can slip bytes in between.
+                    with self._store.atomic_commit():
+                        self._store.check_new_blob_quota(digest, len(data))
+                        previous_chunks = session.chunks
+                        session.committed = True
+                        session.final_digest = digest
+                        session.chunks = []
+                        try:
+                            self._state.save(self._sessions)
+                        except UploadStateError:
+                            # Commit not confirmed: roll the session back; nothing was stored.
+                            session.committed = False
+                            session.final_digest = None
+                            session.chunks = previous_chunks
+                            raise
+                        # Persistence is confirmed; only now does the process-memory
+                        # blob store gain the blob/reference.
+                        blob = self._store.put_completed(data, session.declared_digest,
+                                                         session.media_type)
                 return session, blob
         with session.lock:
             if session.deleted:
@@ -1707,8 +1770,9 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
 
 
 def serve(host: str = "127.0.0.1", port: int = 18895,
-          upload_state: str | None = None) -> ThreadingHTTPServer:
-    store = Store()
+          upload_state: str | None = None,
+          max_store_bytes: int | None = None) -> ThreadingHTTPServer:
+    store = Store(max_store_bytes=max_store_bytes)
     state: UploadState | None = None
     sessions: dict[str, UploadSession] | None = None
     if upload_state is not None:
@@ -1730,9 +1794,14 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18895)
     parser.add_argument("--upload-state", default=None,
                         help="path to the upload session state file (resumable across restarts)")
+    parser.add_argument("--max-store-bytes", type=int, default=None, metavar="N",
+                        help="cap the total stored blob bytes at N (a positive integer); "
+                             "writes that would exceed the cap fail with 413 quota_exceeded")
     args = parser.parse_args()
+    if args.max_store_bytes is not None and args.max_store_bytes < 1:
+        parser.error("--max-store-bytes must be a positive integer")
     try:
-        server = serve(args.host, args.port, args.upload_state)
+        server = serve(args.host, args.port, args.upload_state, args.max_store_bytes)
     except UploadStateInvalid as error:
         print(f"upload state invalid: {error}", file=sys.stderr)
         sys.exit(1)

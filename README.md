@@ -7,10 +7,13 @@
 ```bash
 PYTHONPATH=src python3 -m artifacts.app --port 18895
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads.json
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --max-store-bytes 268435456
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。
+
+可选的服务级容量配额：`--max-store-bytes N`（`serve()` 的 `max_store_bytes` 参数同义，取值为正整数）约束进程内**全部已存 blob 内容的总字节数**；不提供时无总容量上限。配额只按不同摘要实际占用的原始字节合计：重复 PUT 相同内容仍只存一份、refs +1，不增加占用；refs 降为 0 但尚未回收的 blob 仍占额，`POST /v1/gc` 删除后才释放。`PUT /v1/blobs`、上传会话 complete 与 `POST /v1/mirror/pull` 在成功写入前**原子**检查本次新增内容是否超限，任何成功提交后总占用都不越限；mirror/pull 仍为全有或全无，任一新增 blob 会超限则整批不入库。触发配额统一返回 `413`，响应体固定为 `{"error":{"code":"quota_exceeded","message":"store byte quota exceeded"}}`，本次操作不产生可见存储变化（complete 的会话保持 uncommitted 可续传）。各入口既有的 `400`/`404`/`409` 校验（空体、超单体上限、摘要格式、声明摘要不匹配、会话状态等）均先于配额判断；并发写入按单次操作原子裁决，两个同时成功的写入合计不会超限。
 
 ## 接口
 
@@ -219,7 +222,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|conflict|mirror_error|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|conflict|quota_exceeded|mirror_error|internal_error", "message": "<可读说明>"}}
 ```
 
 优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `conflict`（如分片本身非法先于 offset 冲突，`upload_id` 格式非法先于会话查找）。
