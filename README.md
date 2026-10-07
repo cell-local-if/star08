@@ -229,6 +229,24 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 - 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体固定为 `{"error":{"code":"internal_error","message":"store state write failed"}}`；该次变更**不确认**并回滚内存，重启后只恢复最近一次成功持久化的状态。
 - `--store-state` 与 `--upload-state` 相互独立，可单独或同时启用；只配置 `--upload-state` 时 complete 得到的 blob 重启后消失这一既有结果保留。GET、HEAD、Range、presence、分页、graph、resolve、lock、上传会话以及既有 `400`、`404`、`409`、`413`、`502` 的优先级和响应形状均不受 `--store-state` 影响；单 blob 上限、配额原子判断与摘要校验同样保留。
 
+## 进程内审计（`GET /v1/events`）
+
+记录本进程内**成功提交**的变更请求，按提交顺序分配从 1 开始递增的 `seq`。只读请求与失败请求（`400`/`404`/`409`/`413`/`502`、状态写入 `500`）一律不记。
+
+每个事件为 `{"seq","op","result"}`：
+
+- `op` 取值：`blob_put`（`PUT /v1/blobs`）、`upload_create` / `upload_append` / `upload_delete` / `upload_complete`（上传会话四个写动词）、`mirror_pull`（`POST /v1/mirror/pull`）、`blob_release`（`DELETE /v1/blobs/{digest}/refs`）、`gc`（`POST /v1/gc`）。
+- `result` 沿用该请求原有的成功 JSON，并按操作补充字段：上传四个操作补 `upload_id`（`upload_delete` 原响应无体，事件只含 `upload_id`）；`blob_put` 补实际 `refs`（重复 PUT 记录提交后的真实引用数）；其余操作无补充字段，不适用字段省略。多 digest 的 `mirror_pull` 与 `gc` 每次请求各记一条。
+
+查询参数只接受：
+
+- `after`：非负十进制整数，缺省 `0`；只返回 `seq` 严格大于它的事件。
+- `limit`：`1` 到 `100`，缺省 `50`。
+
+成功：`200 {"events":[...], "next_after":..., "has_more":...}`，只含这三个字段。`events` 按 `seq` 升序；`next_after` 为本页末条 `seq`，空页时等于 `after`；`has_more` 表示同一一致快照中本页之后还有事件。单次请求基于一次一致快照分页，并发提交不会混入半条事件或撕裂页面。参数未知、重复或非法 ⇒ `400 invalid_request`。
+
+审计只存在于**进程内存**：不写入 `--store-state` 或 `--upload-state` 文件，重启后事件清空、`seq` 从 1 重新计数。事件写入是每次原子提交的最后一步：事件插入失败时本次变更**不得提交**，对应请求返回 `500 {"error":{"code":"internal_error","message":"audit write failed"}}`，存储与上传会话状态均回滚保持不变。
+
 ## 错误语义
 
 ```json
@@ -239,4 +257,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、审计与可观测性。
+增量去重、签名与信任链、可观测性。

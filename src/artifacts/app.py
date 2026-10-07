@@ -25,6 +25,7 @@ CHUNK_MAX = 262_144
 UPLOAD_ID_BYTES = 16  # token_hex(16) -> 32 lowercase hex characters
 DIGEST_LENGTH = 64
 MAX_LIMIT = 100
+EVENTS_DEFAULT_LIMIT = 50
 PRESENCE_MAX_DIGESTS = 100
 UPLOAD_STATE_VERSION = 1
 STORE_STATE_VERSION = 1
@@ -106,6 +107,15 @@ class MirrorError(StoreError):
 
     def __init__(self) -> None:
         super().__init__("remote sync failed")
+
+
+class AuditError(StoreError):
+    """The audit event for a mutation could not be recorded; the change must not commit."""
+
+    code, status = "internal_error", 500
+
+    def __init__(self) -> None:
+        super().__init__("audit write failed")
 
 
 def is_digest(value: Any) -> bool:
@@ -458,6 +468,33 @@ def parse_blob_query(query_string: str) -> dict[str, Any]:
     return filters
 
 
+def parse_events_query(query_string: str) -> tuple[int, int]:
+    """Validate the GET /v1/events query string into (after, limit).
+
+    Only `after` (a non-negative decimal; only events with a strictly greater
+    seq are returned) and `limit` (1..MAX_LIMIT) are accepted, defaulting to
+    0 and EVENTS_DEFAULT_LIMIT. Unknown, repeated or malformed parameters are
+    an InvalidRequest.
+    """
+    pairs = urllib.parse.parse_qsl(query_string, keep_blank_values=True)
+    names = [name for name, _ in pairs]
+    for name in names:
+        if name not in ("after", "limit"):
+            raise InvalidRequest(f"unknown query parameter {name!r}")
+    if len(names) != len(set(names)):
+        raise InvalidRequest("query parameters must not repeat")
+    raw = dict(pairs)
+    after = 0
+    if "after" in raw:
+        after = _decimal_param("after", raw["after"])
+    limit = EVENTS_DEFAULT_LIMIT
+    if "limit" in raw:
+        limit = _decimal_param("limit", raw["limit"])
+        if not 1 <= limit <= MAX_LIMIT:
+            raise InvalidRequest(f"limit must be between 1 and {MAX_LIMIT}")
+    return after, limit
+
+
 def parse_presence(raw: bytes) -> list[str]:
     """Validate a POST /v1/blobs/presence body into its list of unique digests.
 
@@ -753,6 +790,48 @@ class StoreState:
             raise StoreStateError() from error
 
 
+class AuditLog:
+    """In-process audit trail of confirmed mutations, one event per request.
+
+    Events are appended under one lock in commit order, each ``{"seq", "op",
+    "result"}`` with ``seq`` counting up from 1. The trail lives only in this
+    process — it is never written to the store-state or upload-state files —
+    so a restart clears it and seq starts over from 1. record() is the last
+    step of every mutating entry's atomic commit: an AuditError means the
+    event did not land, so the caller rolls its mutation back and the request
+    fails instead of committing an unaudited change.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: list[dict[str, Any]] = []
+        self._next_seq = 1
+
+    def record(self, op: str, result: dict[str, Any]) -> None:
+        """Append one event atomically. Raises AuditError if it cannot be recorded."""
+        with self._lock:
+            self._events.append({"seq": self._next_seq, "op": op, "result": result})
+            self._next_seq += 1
+
+    def page(self, after: int, limit: int) -> dict[str, Any]:
+        """One consistent snapshot page: up to `limit` events with seq > `after`.
+
+        Concurrent commits cannot tear the page or split an event: the whole
+        page is copied under the trail lock. ``next_after`` is the seq of the
+        last event on the page, or `after` itself when the page is empty;
+        ``has_more`` tells whether the snapshot held further events.
+        """
+        with self._lock:
+            matching = [event for event in self._events if event["seq"] > after]
+            page = matching[:limit]
+            return {
+                "events": [{"seq": event["seq"], "op": event["op"], "result": event["result"]}
+                           for event in page],
+                "next_after": page[-1]["seq"] if page else after,
+                "has_more": len(matching) > limit,
+            }
+
+
 class Store:
     """In-memory, deduplicated by digest. `put` returns the blob metadata; repeats are no-ops.
 
@@ -769,11 +848,18 @@ class Store:
     and the last successful file never diverge. `restored` carries the
     (digest, data, media_type, refs) tuples a StoreState.load() produced at
     startup; refs-0 records are restored too and still wait for the next gc().
+
+    With `audit` (an AuditLog) every confirmed mutation is also recorded as
+    one event, as the last step of the atomic commit: a failed event write
+    rolls the mutation back (re-persisting the state file best effort) and
+    surfaces as AuditError, so no change is ever committed without its event.
+    Without the argument the store keeps its own private trail.
     """
 
     def __init__(self, max_store_bytes: int | None = None,
                  state: StoreState | None = None,
-                 restored: list[tuple[str, bytes, str, int]] | None = None) -> None:
+                 restored: list[tuple[str, bytes, str, int]] | None = None,
+                 audit: AuditLog | None = None) -> None:
         if max_store_bytes is not None and (
                 not isinstance(max_store_bytes, int) or isinstance(max_store_bytes, bool)
                 or max_store_bytes < 1):
@@ -784,6 +870,7 @@ class Store:
         self._refs: dict[str, int] = {}
         self._max_store_bytes = max_store_bytes
         self._state = state
+        self._audit = audit if audit is not None else AuditLog()
         for digest, data, media_type, refs in restored or ():
             self._blobs[digest] = data
             self._meta[digest] = Blob(digest, len(data), media_type)
@@ -798,6 +885,33 @@ class Store:
         """
         if self._state is not None:
             self._state.save(self._blobs, self._meta, self._refs)
+
+    def _commit_locked(self, op: str, result: dict[str, Any]) -> None:
+        """Persist the mutation, then record its audit event. Caller must hold the lock.
+
+        A StoreStateError means nothing was persisted and nothing is recorded;
+        an AuditError means the state file already holds the mutation, so the
+        caller must roll its in-memory change back and re-persist.
+        """
+        self._persist_locked()
+        self._audit.record(op, result)
+
+    def _repersist_locked(self) -> None:
+        """Best-effort persist after an audit-failure rollback.
+
+        The request has already failed, so a further write failure here cannot
+        change the outcome and must not mask the AuditError.
+        """
+        try:
+            self._persist_locked()
+        except StoreStateError:
+            pass
+
+    def _blob_event(self, digest: str) -> dict[str, Any]:
+        """The blob_put event result for a just-committed digest. Caller must hold the lock."""
+        blob = self._meta[digest]
+        return {"digest": blob.digest, "size": blob.size,
+                "media_type": blob.media_type, "refs": self._refs[digest]}
 
     def _stored_bytes(self) -> int:
         """Total raw bytes held right now. Caller must hold the lock."""
@@ -846,9 +960,13 @@ class Store:
             if digest in self._blobs:
                 self._refs[digest] += 1
                 try:
-                    self._persist_locked()
+                    self._commit_locked("blob_put", self._blob_event(digest))
                 except StoreStateError:
                     self._refs[digest] -= 1
+                    raise
+                except AuditError:
+                    self._refs[digest] -= 1
+                    self._repersist_locked()
                     raise
             else:
                 self._quota_check(len(raw))
@@ -856,11 +974,17 @@ class Store:
                 self._meta[digest] = Blob(digest, len(raw), media_type or "application/octet-stream")
                 self._refs[digest] = 1
                 try:
-                    self._persist_locked()
+                    self._commit_locked("blob_put", self._blob_event(digest))
                 except StoreStateError:
                     del self._blobs[digest]
                     del self._meta[digest]
                     del self._refs[digest]
+                    raise
+                except AuditError:
+                    del self._blobs[digest]
+                    del self._meta[digest]
+                    del self._refs[digest]
+                    self._repersist_locked()
                     raise
             return self._meta[digest]
 
@@ -992,17 +1116,26 @@ class Store:
                     synced.append(digest)
                 else:
                     missing.append(digest)
+            result = {"synced": synced, "existing": existing, "missing": missing}
             try:
                 # One persist for the whole batch: a multi-digest pull never
-                # lands on disk as a partial result.
-                self._persist_locked()
+                # lands on disk as a partial result; one audit event per pull,
+                # however many digests it carried.
+                self._commit_locked("mirror_pull", result)
             except StoreStateError:
                 for digest in synced:
                     del self._blobs[digest]
                     del self._meta[digest]
                     del self._refs[digest]
                 raise
-        return {"synced": synced, "existing": existing, "missing": missing}
+            except AuditError:
+                for digest in synced:
+                    del self._blobs[digest]
+                    del self._meta[digest]
+                    del self._refs[digest]
+                self._repersist_locked()
+                raise
+        return result
 
     def release(self, digest: Any) -> int:
         """Drop one reference to a blob. Content is kept even at refs 0; only gc() reclaims it.
@@ -1019,9 +1152,13 @@ class Store:
                 raise DigestConflict(f"blob {digest} has no references left to release")
             self._refs[digest] = refs - 1
             try:
-                self._persist_locked()
+                self._commit_locked("blob_release", {"digest": digest, "refs": refs - 1})
             except StoreStateError:
                 self._refs[digest] = refs
+                raise
+            except AuditError:
+                self._refs[digest] = refs
+                self._repersist_locked()
                 raise
             return refs - 1
 
@@ -1034,8 +1171,11 @@ class Store:
                 del self._blobs[digest]
                 del self._meta[digest]
                 del self._refs[digest]
+            stats = {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
+                     "puts": sum(self._refs.values())}
+            result = {"deleted": deleted, "stats": stats}
             try:
-                self._persist_locked()
+                self._commit_locked("gc", result)
             except StoreStateError:
                 # Reclaim not confirmed: every deleted record goes back untouched.
                 for digest in deleted:
@@ -1044,9 +1184,15 @@ class Store:
                     self._meta[digest] = blob
                     self._refs[digest] = 0
                 raise
-            stats = {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
-                     "puts": sum(self._refs.values())}
-        return {"deleted": deleted, "stats": stats}
+            except AuditError:
+                for digest in deleted:
+                    data, blob = held[digest]
+                    self._blobs[digest] = data
+                    self._meta[digest] = blob
+                    self._refs[digest] = 0
+                self._repersist_locked()
+                raise
+        return result
 
     def graph(self, root_digest: Any) -> dict[str, Any]:
         """Resolve the dependency graph reachable from a root manifest.
@@ -1188,6 +1334,29 @@ class Store:
                     del self._refs[digest]
                     raise
             return self._meta[digest]
+
+    def contains(self, digest: str) -> bool:
+        """Whether `digest` is currently stored; atomic only under atomic_commit()."""
+        with self._lock:
+            return digest in self._blobs
+
+    def undo_put_completed(self, digest: str, created: bool) -> None:
+        """Reverse a confirmed put_completed whose surrounding commit then failed.
+
+        Caller must hold atomic_commit() (upload complete does). `created` is
+        whether the put inserted a new blob rather than adding a reference to
+        an existing one. The state file is re-persisted best effort so memory
+        and the last successful file keep agreeing; the request has already
+        failed, so a further write failure cannot change the outcome.
+        """
+        with self._lock:
+            if created:
+                del self._blobs[digest]
+                del self._meta[digest]
+                del self._refs[digest]
+            else:
+                self._refs[digest] -= 1
+            self._repersist_locked()
 
 
 MIRROR_TIMEOUT = 10  # seconds per remote call
@@ -1515,15 +1684,23 @@ class UploadManager:
     create/append/delete/complete is persisted (under a global persist lock so
     full-snapshot writes never interleave) before success is returned; a failed
     write rolls the in-process change back and surfaces as a 500.
+
+    Every confirmed create/append/delete/complete also records one audit event
+    as the last step of the commit, in the manager's AuditLog — by default the
+    store's own trail, so blob and upload events share one process-wide seq.
+    A failed event write rolls the change back (re-persisting state best
+    effort) and surfaces as AuditError.
     """
 
     def __init__(self, store: Store, state: UploadState | None = None,
-                 sessions: dict[str, UploadSession] | None = None) -> None:
+                 sessions: dict[str, UploadSession] | None = None,
+                 audit: AuditLog | None = None) -> None:
         self._store = store
         self._lock = threading.Lock()
         self._persist_lock = threading.Lock()
         self._state = state
         self._sessions: dict[str, UploadSession] = sessions if sessions is not None else {}
+        self._audit = audit if audit is not None else store._audit
 
     @staticmethod
     def parse_create(raw: bytes) -> tuple[int, str, str | None]:
@@ -1573,6 +1750,19 @@ class UploadManager:
                     with self._lock:
                         del self._sessions[upload_id]
                     raise
+                try:
+                    self._audit.record("upload_create", {
+                        "upload_id": upload_id, "size": size,
+                        "received": 0, "status": "uncommitted"})
+                except AuditError:
+                    # The event did not land: the create is not confirmed.
+                    with self._lock:
+                        del self._sessions[upload_id]
+                    try:
+                        self._state.save(self._sessions)
+                    except UploadStateError:
+                        pass
+                    raise
                 return session
         with self._lock:
             while True:
@@ -1581,6 +1771,13 @@ class UploadManager:
                     break
             session = UploadSession(upload_id, size, media_type, declared_digest)
             self._sessions[upload_id] = session
+            try:
+                self._audit.record("upload_create", {
+                    "upload_id": upload_id, "size": size,
+                    "received": 0, "status": "uncommitted"})
+            except AuditError:
+                del self._sessions[upload_id]
+                raise
             return session
 
     def _live(self, upload_id: str) -> UploadSession:
@@ -1623,6 +1820,19 @@ class UploadManager:
                         session.chunks.pop()
                         session.received -= len(chunk)
                         raise
+                    try:
+                        self._audit.record("upload_append", {
+                            "upload_id": upload_id,
+                            "received": session.received,
+                            "status": "uncommitted"})
+                    except AuditError:
+                        session.chunks.pop()
+                        session.received -= len(chunk)
+                        try:
+                            self._state.save(self._sessions)
+                        except UploadStateError:
+                            pass
+                        raise
                     return session
         with session.lock:
             # A concurrent delete (serialized on this same lock) may have tombstoned it.
@@ -1636,6 +1846,15 @@ class UploadManager:
                 raise UploadConflict("chunk would exceed the declared size")
             session.chunks.append(chunk)
             session.received += len(chunk)
+            try:
+                self._audit.record("upload_append", {
+                    "upload_id": upload_id,
+                    "received": session.received,
+                    "status": "uncommitted"})
+            except AuditError:
+                session.chunks.pop()
+                session.received -= len(chunk)
+                raise
             return session
 
     @staticmethod
@@ -1669,13 +1888,30 @@ class UploadManager:
                         session.deleted = False
                         session.chunks = previous_chunks
                         raise
+                    try:
+                        self._audit.record("upload_delete", {"upload_id": upload_id})
+                    except AuditError:
+                        session.deleted = False
+                        session.chunks = previous_chunks
+                        try:
+                            self._state.save(self._sessions)
+                        except UploadStateError:
+                            pass
+                        raise
                 return
         with session.lock:
             if session.committed:
                 raise UploadConflict("upload session is already committed")
             # 204 wins exactly once: the id stays in the table as an invisible tombstone.
+            previous_chunks = session.chunks
             session.deleted = True
-            session.chunks.clear()
+            session.chunks = []
+            try:
+                self._audit.record("upload_delete", {"upload_id": upload_id})
+            except AuditError:
+                session.deleted = False
+                session.chunks = previous_chunks
+                raise
 
     def complete(self, upload_id: str) -> tuple[UploadSession, Blob]:
         session = self._live(upload_id)
@@ -1701,6 +1937,7 @@ class UploadManager:
                     # and no concurrent writer can slip bytes in between.
                     with self._store.atomic_commit():
                         self._store.check_new_blob_quota(digest, len(data))
+                        created = not self._store.contains(digest)
                         previous_chunks = session.chunks
                         session.committed = True
                         session.final_digest = digest
@@ -1730,6 +1967,26 @@ class UploadManager:
                             except UploadStateError:
                                 pass
                             raise
+                        try:
+                            self._audit.record("upload_complete", {
+                                "upload_id": upload_id,
+                                "digest": blob.digest,
+                                "size": blob.size,
+                                "media_type": blob.media_type,
+                            })
+                        except AuditError:
+                            # The event did not land: the commit is not confirmed.
+                            # Roll the blob and the session back (both re-persisted
+                            # best effort — the request already failed).
+                            self._store.undo_put_completed(blob.digest, created)
+                            session.committed = False
+                            session.final_digest = None
+                            session.chunks = previous_chunks
+                            try:
+                                self._state.save(self._sessions)
+                            except UploadStateError:
+                                pass
+                            raise
                 return session, blob
         with session.lock:
             if session.deleted:
@@ -1741,14 +1998,31 @@ class UploadManager:
                     f"received {session.received} of {session.size} bytes; cannot complete")
             data = b"".join(session.chunks)
             # DigestConflict propagates before any state change: no blob, session stays resumable.
-            blob = self._store.put_completed(data, session.declared_digest, session.media_type)
-            session.committed = True
-            session.final_digest = blob.digest
-            session.chunks.clear()  # bytes now live in the store
+            with self._store.atomic_commit():
+                created = not self._store.contains(digest_of(data))
+                blob = self._store.put_completed(data, session.declared_digest, session.media_type)
+                previous_chunks = session.chunks
+                session.committed = True
+                session.final_digest = blob.digest
+                session.chunks = []  # bytes now live in the store
+                try:
+                    self._audit.record("upload_complete", {
+                        "upload_id": upload_id,
+                        "digest": blob.digest,
+                        "size": blob.size,
+                        "media_type": blob.media_type,
+                    })
+                except AuditError:
+                    self._store.undo_put_completed(blob.digest, created)
+                    session.committed = False
+                    session.final_digest = None
+                    session.chunks = previous_chunks
+                    raise
         return session, blob
 
 
-def make_handler(store: Store, uploads: UploadManager | None = None) -> type[BaseHTTPRequestHandler]:
+def make_handler(store: Store, uploads: UploadManager | None = None,
+                 audit: AuditLog | None = None) -> type[BaseHTTPRequestHandler]:
     if uploads is None:
         uploads = UploadManager(store)
 
@@ -1845,6 +2119,13 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     blobs = [{"digest": b.digest, "size": b.size, "media_type": b.media_type, "refs": refs}
                              for b, refs in items]
                     return self._send(200, {"blobs": blobs, "stats": stats})
+                if parts == ["v1", "events"]:
+                    query_string = urllib.parse.urlsplit(self.path).query
+                    after, limit = parse_events_query(query_string)
+                    # Resolved per request so the endpoint always reads the
+                    # trail the store currently records into.
+                    trail = audit if audit is not None else store._audit
+                    return self._send(200, trail.page(after, limit))
                 if len(parts) == 3 and parts[:2] == ["v1", "blobs"]:
                     return self._get_blob(parts[2])
                 if len(parts) == 4 and parts[:2] == ["v1", "blobs"] and parts[3] == "graph":
@@ -1981,14 +2262,16 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
 def serve(host: str = "127.0.0.1", port: int = 18895,
           upload_state: str | None = None,
           max_store_bytes: int | None = None,
-          store_state: str | None = None) -> ThreadingHTTPServer:
+          store_state: str | None = None,
+          audit: AuditLog | None = None) -> ThreadingHTTPServer:
     blob_state: StoreState | None = None
     restored: list[tuple[str, bytes, str, int]] | None = None
     if store_state is not None:
         blob_state = StoreState(store_state)
         # Refuse to listen on an empty/corrupt/structurally wrong/incompatible file.
         restored = blob_state.load()
-    store = Store(max_store_bytes=max_store_bytes, state=blob_state, restored=restored)
+    store = Store(max_store_bytes=max_store_bytes, state=blob_state, restored=restored,
+                  audit=audit)
     state: UploadState | None = None
     sessions: dict[str, UploadSession] | None = None
     if upload_state is not None:

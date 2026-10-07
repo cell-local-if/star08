@@ -15,6 +15,8 @@ warnings.filterwarnings(
 from .app import (  # noqa: E402,F401
     CHUNK_MAX,
     MAX_BLOB,
+    AuditError,
+    AuditLog,
     Blob,
     BlobNotFound,
     DigestConflict,
@@ -45,6 +47,7 @@ from .app import (  # noqa: E402,F401
     make_handler,
     mirror_pull,
     parse_constraint_token,
+    parse_events_query,
     parse_if_range,
     parse_manifest,
     parse_mirror_pull,
@@ -57,6 +60,8 @@ from .app import (  # noqa: E402,F401
 __all__ = [
     "CHUNK_MAX",
     "MAX_BLOB",
+    "AuditError",
+    "AuditLog",
     "Blob",
     "BlobNotFound",
     "DigestConflict",
@@ -87,6 +92,7 @@ __all__ = [
     "make_handler",
     "mirror_pull",
     "parse_constraint_token",
+    "parse_events_query",
     "parse_if_range",
     "parse_manifest",
     "parse_mirror_pull",
