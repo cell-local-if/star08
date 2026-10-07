@@ -7,10 +7,11 @@
 ```bash
 PYTHONPATH=src python3 -m artifacts.app --port 18895
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads.json
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --max-store-bytes 104857600
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。
+Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。提供 `--max-store-bytes N`（`serve()` 的 `max_store_bytes` 参数同义，正整数）后，全部已存 blob 的原始字节合计不得越过 N；不提供时无总容量上限（见下文「存储容量配额」）。
 
 ## 接口
 
@@ -216,10 +217,22 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 - 启动时状态文件**为空、损坏、结构不符或版本不兼容**：服务**不监听**，进程以非零状态退出，标准错误输出一行 `upload state invalid: <path>`；文件不存在等同于尚无会话，正常启动。
 - 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体为 `{"error":{"code":"internal_error","message":"upload state write failed"}}`；该次变更**不确认**并回滚，重启后只恢复最近一次成功持久化的状态。除上述启动与持久化失败结果外，现有校验优先级以及 `400 invalid_request`、`404 not_found`、`409 conflict` 的适用条件不变。
 
+## 存储容量配额（`--max-store-bytes N`）
+
+可选的服务级总容量配额，约束进程内**全部已存 blob 内容的原始字节合计**；`serve()` 以同名可选参数 `max_store_bytes` 接受，取值为正整数。不提供时不设总上限，各入口行为与既有基线完全一致。
+
+- 配额按**不同摘要实际占用的字节**合计：重复 PUT 相同内容只存一份、refs +1，不增加占用，即使此时总量已达上限也照常成功。
+- `refs == 0` 但尚未回收的 blob **仍占额**；`POST /v1/gc` 删除后才释放对应字节。
+- `PUT /v1/blobs`、上传会话 complete、`POST /v1/mirror/pull` 在成功写入前**原子**检查本次新增内容是否使总占用越限：越限则本次操作**不产生任何可见存储变化**，统一返回 `413`，响应体固定为 `{"error":{"code":"quota_exceeded","message":"store byte quota exceeded"}}`。
+- mirror/pull 仍为**全有或全无**：只要任一新增 blob 会超限，已从远端取到的内容也不写入本地；已有 blob 的字节、media type、refs 与 stats 不变。
+- 校验优先级不变：PUT 的空体、超单体上限、摘要格式与声明摘要不匹配等 `400`/`409`，以及 complete 的会话不存在、未收齐、重复提交、已删除、声明摘要不匹配等 `404`/`409`，均**先于**配额判断。
+- 并发的 PUT、complete、mirror/pull、release 与 gc 仍按单次操作原子裁决：两个同时成功的写入合计不会越限，超限请求不会留下部分字节或部分批次。
+- GET、HEAD、Range、presence、列表、graph、resolve、lock、上传会话持久化与 gc 的语义不变；`stats.bytes` 继续反映回收后的实际剩余字节。
+
 ## 错误语义
 
 ```json
-{"error": {"code": "invalid_request|not_found|conflict|mirror_error|internal_error", "message": "<可读说明>"}}
+{"error": {"code": "invalid_request|not_found|conflict|quota_exceeded|mirror_error|internal_error", "message": "<可读说明>"}}
 ```
 
 优先级：`Content-Length` 校验先于读体；路由不匹配先于体校验；`invalid_request` 先于 `conflict`（如分片本身非法先于 offset 冲突，`upload_id` 格式非法先于会话查找）。
