@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -13,7 +14,9 @@ import secrets
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -59,6 +62,15 @@ class RangeNotSatisfiable(StoreError):
 
 class UploadConflict(DigestConflict):
     """A resumable upload session is in the wrong state for the requested action."""
+
+
+class MirrorError(StoreError):
+    """Any failure while pulling from a remote mirror; nothing is stored."""
+
+    code, status = "mirror_error", 502
+
+    def __init__(self) -> None:
+        super().__init__("remote sync failed")
 
 
 class UploadStateError(StoreError):
@@ -287,6 +299,21 @@ def parse_blob_query(query_string: str) -> dict[str, Any]:
     return filters
 
 
+def _digest_list(value: Any) -> list[str]:
+    """Validate a digests array: 1..PRESENCE_MAX_DIGESTS unique 64-char lowercase hex."""
+    if not isinstance(value, list):
+        raise InvalidRequest("digests must be an array")
+    if not 1 <= len(value) <= PRESENCE_MAX_DIGESTS:
+        raise InvalidRequest(
+            f"digests must contain between 1 and {PRESENCE_MAX_DIGESTS} entries")
+    for digest in value:
+        if not is_digest(digest):
+            raise InvalidRequest("each digest must be 64 lowercase hex characters")
+    if len(set(value)) != len(value):
+        raise InvalidRequest("digests must not repeat")
+    return value
+
+
 def parse_presence(raw: bytes) -> list[str]:
     """Validate a POST /v1/blobs/presence body into its list of unique digests.
 
@@ -305,18 +332,53 @@ def parse_presence(raw: bytes) -> list[str]:
     extra = set(payload) - {"digests"}
     if extra:
         raise InvalidRequest(f"unknown field {sorted(extra)[0]!r}")
-    digests = payload["digests"]
-    if not isinstance(digests, list):
-        raise InvalidRequest("digests must be an array")
-    if not 1 <= len(digests) <= PRESENCE_MAX_DIGESTS:
+    return _digest_list(payload["digests"])
+
+
+def _parse_base_url(value: Any) -> str:
+    """Validate a mirror base_url into its normalized ``scheme://netloc`` form.
+
+    Only an http or https site root is accepted: no userinfo, no query, no
+    fragment, and no path beyond the bare root slash.
+    """
+    if not isinstance(value, str):
+        raise InvalidRequest("base_url must be a string")
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port  # accessing .port raises ValueError on a malformed/out-of-range port
+    except ValueError as error:
         raise InvalidRequest(
-            f"digests must contain between 1 and {PRESENCE_MAX_DIGESTS} entries")
-    for digest in digests:
-        if not is_digest(digest):
-            raise InvalidRequest("each digest must be 64 lowercase hex characters")
-    if len(set(digests)) != len(digests):
-        raise InvalidRequest("digests must not repeat")
-    return digests
+            "base_url must be an http or https site root without userinfo, query or fragment"
+        ) from error
+    if parts.scheme not in ("http", "https") or not parts.hostname \
+            or parts.username is not None or parts.password is not None \
+            or parts.query or parts.fragment or parts.path not in ("", "/") \
+            or any(c.isspace() for c in parts.netloc):
+        raise InvalidRequest(
+            "base_url must be an http or https site root without userinfo, query or fragment")
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def parse_mirror_pull(raw: bytes) -> tuple[str, list[str]]:
+    """Validate a POST /v1/mirror/pull body into (base_url, digests).
+
+    Must be a UTF-8 JSON object with exactly the fields ``base_url`` and
+    ``digests``; every shape, address or digest violation is an InvalidRequest.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InvalidRequest("request body must be a UTF-8 JSON object") from error
+    if not isinstance(payload, dict):
+        raise InvalidRequest("request body must be a JSON object")
+    extra = set(payload) - {"base_url", "digests"}
+    if extra:
+        raise InvalidRequest(f"unknown field {sorted(extra)[0]!r}")
+    if "base_url" not in payload:
+        raise InvalidRequest("base_url is required")
+    if "digests" not in payload:
+        raise InvalidRequest("digests is required")
+    return _parse_base_url(payload["base_url"]), _digest_list(payload["digests"])
 
 
 def parse_range(value: str, size: int) -> tuple[int, int]:
@@ -511,6 +573,35 @@ class Store:
         present_digests = {entry["digest"] for entry in present}
         missing = sorted(requested - present_digests)
         return {"present": present, "missing": missing, "stats": stats}
+
+    def existing_digests(self, digests: list[str]) -> set[str]:
+        """Which of `digests` are currently stored; one read-only lock acquisition."""
+        with self._lock:
+            return {digest for digest in digests if digest in self._blobs}
+
+    def mirror_commit(self, fetched: list[tuple[str, bytes, str]],
+                      digests: list[str]) -> dict[str, Any]:
+        """Atomically store validated mirror pulls and partition the request.
+
+        One lock acquisition: each fetched blob is inserted only if still absent
+        (new blobs get refs 1; anything already stored — by a concurrent PUT,
+        upload complete or an earlier pull — is left untouched, so retries never
+        add references). The response partition is computed from the same
+        instant: ``synced`` newly stored here, ``existing`` already local at
+        commit time, ``missing`` neither; the three are sorted, disjoint and
+        cover exactly `digests`.
+        """
+        with self._lock:
+            synced: set[str] = set()
+            for digest, data, media_type in fetched:
+                if digest not in self._blobs:
+                    self._blobs[digest] = data
+                    self._meta[digest] = Blob(digest, len(data), media_type)
+                    self._refs[digest] = 1
+                    synced.add(digest)
+            existing = sorted(d for d in digests if d not in synced and d in self._blobs)
+            missing = sorted(d for d in digests if d not in synced and d not in self._blobs)
+        return {"synced": sorted(synced), "existing": existing, "missing": missing}
 
     def release(self, digest: Any) -> int:
         """Drop one reference to a blob. Content is kept even at refs 0; only gc() reclaims it.
@@ -827,6 +918,104 @@ class Store:
                 self._meta[digest] = Blob(digest, len(data), media_type)
                 self._refs[digest] = 1
             return self._meta[digest]
+
+
+_MIRROR_TIMEOUT = 10
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Mirror pulls accept only literal 200 responses; a redirect is a remote error."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        return None
+
+
+# Read-only client for mirror remotes: no proxies (and no proxy credentials
+# from the environment), no redirects, nothing but the request itself sent.
+_mirror_opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def _mirror_request(request: urllib.request.Request) -> tuple[Any, bytes]:
+    """Run one remote call; any transport failure or non-200 status is a MirrorError."""
+    try:
+        with _mirror_opener.open(request, timeout=_MIRROR_TIMEOUT) as response:
+            if response.status != 200:
+                raise MirrorError()
+            headers = response.headers
+            body = response.read(MAX_BLOB + 1025)
+    except MirrorError:
+        raise
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
+        raise MirrorError() from error
+    return headers, body
+
+
+def _remote_presence(base_url: str, digests: list[str]) -> set[str]:
+    """POST the sorted digests to the remote presence endpoint; return remote-present digests.
+
+    The response must be a JSON object with exactly ``present`` and ``missing``:
+    sorted digest arrays whose disjoint union is exactly the request. Any
+    deviation — transport failure, non-200, bad shape, unsorted or incomplete
+    coverage — is a MirrorError and nothing is stored.
+    """
+    body = json.dumps({"digests": sorted(digests)}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/v1/blobs/presence", data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    _headers, raw = _mirror_request(request)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MirrorError() from error
+    if not isinstance(payload, dict) or set(payload) != {"present", "missing"}:
+        raise MirrorError()
+    present, missing = payload["present"], payload["missing"]
+    if not isinstance(present, list) or not isinstance(missing, list):
+        raise MirrorError()
+    if not all(is_digest(digest) for digest in present + missing):
+        raise MirrorError()
+    if present != sorted(present) or missing != sorted(missing):
+        raise MirrorError()
+    if len(present) + len(missing) != len(digests) \
+            or set(present) | set(missing) != set(digests):
+        raise MirrorError()
+    return set(present)
+
+
+def _remote_blob(base_url: str, digest: str) -> tuple[bytes, str]:
+    """GET one blob from the remote; return (bytes, media_type) after full validation."""
+    request = urllib.request.Request(f"{base_url}/v1/blobs/{digest}", method="GET")
+    headers, data = _mirror_request(request)
+    if headers.get("X-Blob-Digest") != digest:
+        raise MirrorError()
+    if not 1 <= len(data) <= MAX_BLOB:
+        raise MirrorError()
+    if digest_of(data) != digest:
+        raise MirrorError()
+    media_type = headers.get("Content-Type") or "application/octet-stream"
+    if len(media_type) > 200:
+        raise MirrorError()
+    return data, media_type
+
+
+def mirror_pull(store: Store, base_url: str, digests: list[str]) -> dict[str, Any]:
+    """Pull `digests` from a remote mirror into `store`.
+
+    The remote is only read, never written, and no credentials are sent.
+    Digests already local at commit time are classified ``existing`` without
+    reading remote bytes; every other remote-present digest is fetched in
+    digest order and fully validated before anything is stored, and the commit
+    is a single atomic insert-if-absent — a failure anywhere stores nothing.
+    """
+    remote_present = _remote_presence(base_url, digests)
+    local = store.existing_digests(digests)
+    fetched: list[tuple[str, bytes, str]] = []
+    for digest in sorted(remote_present - local):
+        data, media_type = _remote_blob(base_url, digest)
+        fetched.append((digest, data, media_type))
+    return store.mirror_commit(fetched, digests)
 
 
 @dataclass
@@ -1435,6 +1624,10 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
                     raw = self._read_body(MAX_BLOB + 1024)
                     digests = parse_presence(raw)
                     return self._send(200, store.presence(digests))
+                if parts == ["v1", "mirror", "pull"]:
+                    raw = self._read_body(MAX_BLOB + 1024)
+                    base_url, digests = parse_mirror_pull(raw)
+                    return self._send(200, mirror_pull(store, base_url, digests))
                 if parts == ["v1", "gc"]:
                     # The body carries no semantics for gc; drain any bytes to keep
                     # the keep-alive connection usable rather than treating them as an error.
