@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 
 MAX_BLOB = 1_048_576
 CHUNK_MAX = 262_144
@@ -911,13 +911,18 @@ class Store:
                      "puts": sum(self._refs.values())}
         return {"deleted": deleted, "stats": stats}
 
-    def graph(self, root_digest: Any) -> dict[str, Any]:
-        """Resolve the dependency graph reachable from a root manifest.
+    def _read_manifest_closure(self, root_digest: Any,
+                               cycle_error: Callable[[str], DigestConflict]
+                               ) -> dict[str, dict[str, Any]]:
+        """Shared first phase of graph/resolve/lock: snapshot and validate the closure.
 
-        One consistent read-only snapshot taken at request start: no refs change, no
-        reclaim timing changes, and concurrent gc cannot tear the result. The whole
-        graph is validated before anything is returned — errors never yield a partial
-        graph.
+        One consistent read-only snapshot is taken at request start: no refs
+        change, no reclaim timing changes, and concurrent gc cannot tear the
+        result. Every manifest reachable from the root is read and validated
+        (iterative DFS, so deep chains cannot overflow the recursion limit)
+        before anything is returned — errors never yield a partial result.
+        `cycle_error` maps the digest where a cycle is detected to the
+        entry-point-specific 409; every other failure is shared verbatim.
         """
         if not is_digest(root_digest):
             raise InvalidRequest("digest must be 64 lowercase hex characters")
@@ -925,8 +930,7 @@ class Store:
             if root_digest not in self._blobs:
                 raise BlobNotFound(f"no blob {root_digest}")
             snapshot = dict(self._blobs)
-        nodes: dict[str, dict[str, str]] = {}
-        edges: set[tuple[str, str, str, str]] = set()
+        manifests: dict[str, dict[str, Any]] = {}
         state: dict[str, str] = {}  # digest -> "visiting" | "done"
         # Iterative DFS (no recursion-depth limit); each stack entry is (digest, expanded).
         stack: list[tuple[str, bool]] = [(root_digest, False)]
@@ -939,56 +943,7 @@ class Store:
             if current == "done":
                 continue
             if current == "visiting":
-                raise DigestConflict(f"dependency cycle detected at blob {digest}")
-            raw = snapshot.get(digest)
-            if raw is None:
-                raise DigestConflict(f"dependency blob {digest} does not exist")
-            manifest = parse_manifest(raw, digest)
-            state[digest] = "visiting"
-            stack.append((digest, True))
-            nodes[digest] = {"digest": digest, "name": manifest["name"],
-                             "version": manifest["version"]}
-            for dep_name, (dep_digest, constraint) in manifest["dependencies"].items():
-                edges.add((digest, dep_digest, dep_name, constraint))
-                if state.get(dep_digest) != "done":
-                    stack.append((dep_digest, False))
-        return {
-            "root": root_digest,
-            "nodes": [nodes[d] for d in sorted(nodes)],
-            "edges": [{"from": f, "to": t, "name": n, "constraint": c}
-                      for f, t, n, c in sorted(edges)],
-        }
-
-    def resolve(self, root_digest: Any) -> dict[str, Any]:
-        """Adjudicate version constraints over the manifests reachable from a root.
-
-        Like graph(), this runs on one read-only snapshot taken at request start
-        and writes nothing: no refs, GC or consistency effects. Every reachable
-        manifest is first validated exactly as graph() does; the constraints borne
-        by all edges sharing a dependency name are then merged into one interval,
-        and the version of the single digest carrying that name must lie in it.
-        Nothing is returned on failure — errors never yield a partial resolution.
-        """
-        if not is_digest(root_digest):
-            raise InvalidRequest("digest must be 64 lowercase hex characters")
-        with self._lock:
-            if root_digest not in self._blobs:
-                raise BlobNotFound(f"no blob {root_digest}")
-            snapshot = dict(self._blobs)
-        manifests: dict[str, dict[str, Any]] = {}
-        state: dict[str, str] = {}  # digest -> "visiting" | "done"
-        # Same iterative DFS as graph(): identical cycle/missing/structure semantics.
-        stack: list[tuple[str, bool]] = [(root_digest, False)]
-        while stack:
-            digest, expanded = stack.pop()
-            if expanded:
-                state[digest] = "done"
-                continue
-            current = state.get(digest)
-            if current == "done":
-                continue
-            if current == "visiting":
-                raise _conflict("cycle", f"detected at blob {digest}")
+                raise cycle_error(digest)
             raw = snapshot.get(digest)
             if raw is None:
                 raise DigestConflict(f"dependency blob {digest} does not exist")
@@ -999,7 +954,20 @@ class Store:
             for dep_name, (dep_digest, _constraint) in manifest["dependencies"].items():
                 if state.get(dep_digest) != "done":
                     stack.append((dep_digest, False))
+        return manifests
 
+    @staticmethod
+    def _adjudicate(manifests: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        """Shared second phase of resolve/lock: merge and adjudicate by name.
+
+        The constraints borne by all edges sharing a dependency name are merged
+        into one interval, and the version of the single digest carrying that
+        name must lie in it (a root's own version is never adjudicated — it is
+        not a dependency target). Returns one entry per dependency name, sorted
+        by name, with the target version verbatim and the deduplicated sorted
+        constraint strings. Any failure raises the shared 409 and nothing
+        partial is returned.
+        """
         # Merge by dependency name: one digest per name, constraints pooled across edges.
         targets: dict[str, str] = {}
         pooled: dict[str, list[str]] = {}
@@ -1044,24 +1012,60 @@ class Store:
             lower, upper = intersection
             if upper is not None and lower >= upper:
                 raise _conflict("empty_intersection", f"for dependency {name!r}")
+            constraints = sorted(set(pooled[name]))
             if not interval_contains(intersection, version_triple):
                 raise _conflict(
                     "version_mismatch",
                     f"dependency {name!r} version {target['version']} does not satisfy "
-                    f"the merged constraints {sorted(set(pooled[name]))}")
+                    f"the merged constraints {constraints}")
             resolved.append({
                 "name": name,
                 "digest": digest,
                 "version": target["version"],
-                "constraints": sorted(set(pooled[name])),
+                "constraints": constraints,
             })
-        return {"root": root_digest, "resolved": resolved}
+        return resolved
+
+    def graph(self, root_digest: Any) -> dict[str, Any]:
+        """Resolve the dependency graph reachable from a root manifest.
+
+        Runs on the shared read-only closure snapshot (see
+        _read_manifest_closure); the whole graph is validated before anything
+        is returned — errors never yield a partial graph.
+        """
+        manifests = self._read_manifest_closure(
+            root_digest,
+            lambda digest: DigestConflict(f"dependency cycle detected at blob {digest}"))
+        edges: set[tuple[str, str, str, str]] = set()
+        for digest, manifest in manifests.items():
+            for dep_name, (dep_digest, constraint) in manifest["dependencies"].items():
+                edges.add((digest, dep_digest, dep_name, constraint))
+        return {
+            "root": root_digest,
+            "nodes": [{"digest": digest, "name": manifests[digest]["name"],
+                       "version": manifests[digest]["version"]}
+                      for digest in sorted(manifests)],
+            "edges": [{"from": f, "to": t, "name": n, "constraint": c}
+                      for f, t, n, c in sorted(edges)],
+        }
+
+    def resolve(self, root_digest: Any) -> dict[str, Any]:
+        """Adjudicate version constraints over the manifests reachable from a root.
+
+        Runs on the shared read-only closure snapshot and the shared
+        name-merging adjudication (see _read_manifest_closure/_adjudicate);
+        nothing is written and errors never yield a partial resolution.
+        """
+        manifests = self._read_manifest_closure(
+            root_digest,
+            lambda digest: _conflict("cycle", f"detected at blob {digest}"))
+        return {"root": root_digest, "resolved": self._adjudicate(manifests)}
 
     def lock(self, root_digest: Any) -> dict[str, Any]:
         """Pin the resolution reachable from a root manifest into a reproducible lock.
 
-        Same request-start read-only snapshot, traversal and adjudication as
-        resolve(): identical cycle/missing/structure semantics and identical
+        Same shared closure snapshot, traversal and adjudication as resolve():
+        identical cycle/missing/structure semantics and identical
         constraint-intersection and target-version checks (the root's own
         version is never adjudicated). Nothing is written — no refs, GC or
         consistency effects — and errors never yield a partial lock.
@@ -1070,86 +1074,10 @@ class Store:
         and dependencies lexicographically), so repeated requests over the same
         store state produce byte-identical JSON regardless of dict order.
         """
-        if not is_digest(root_digest):
-            raise InvalidRequest("digest must be 64 lowercase hex characters")
-        with self._lock:
-            if root_digest not in self._blobs:
-                raise BlobNotFound(f"no blob {root_digest}")
-            snapshot = dict(self._blobs)
-        manifests: dict[str, dict[str, Any]] = {}
-        state: dict[str, str] = {}  # digest -> "visiting" | "done"
-        # Same iterative DFS as graph()/resolve(): identical error semantics.
-        stack: list[tuple[str, bool]] = [(root_digest, False)]
-        while stack:
-            digest, expanded = stack.pop()
-            if expanded:
-                state[digest] = "done"
-                continue
-            current = state.get(digest)
-            if current == "done":
-                continue
-            if current == "visiting":
-                raise _conflict("cycle", f"detected at blob {digest}")
-            raw = snapshot.get(digest)
-            if raw is None:
-                raise DigestConflict(f"dependency blob {digest} does not exist")
-            manifest = parse_manifest(raw, digest)
-            state[digest] = "visiting"
-            stack.append((digest, True))
-            manifests[digest] = manifest
-            for dep_name, (dep_digest, _constraint) in manifest["dependencies"].items():
-                if state.get(dep_digest) != "done":
-                    stack.append((dep_digest, False))
-
-        # Merge by dependency name, exactly as resolve(): one digest per name,
-        # constraints pooled across edges, same checks in the same order.
-        targets: dict[str, str] = {}
-        pooled: dict[str, list[str]] = {}
-        for manifest in manifests.values():
-            for dep_name, (dep_digest, constraint_text) in manifest["dependencies"].items():
-                known = targets.get(dep_name)
-                if known is not None and known != dep_digest:
-                    raise _conflict(
-                        "ambiguous_name",
-                        f"dependency {dep_name!r} references more than one digest")
-                targets[dep_name] = dep_digest
-                pooled.setdefault(dep_name, []).append(constraint_text)
-
-        for name in sorted(targets):
-            digest = targets[name]
-            target = manifests[digest]
-            if target["name"] != name:
-                raise _conflict(
-                    "name_mismatch",
-                    f"dependency key {name!r} does not match manifest name "
-                    f"{target['name']!r} at blob {digest}")
-            try:
-                version_triple = parse_version(target["version"])
-            except ResolveConflict as error:
-                raise ResolveConflict(
-                    f"{error} for dependency {name!r} at blob {digest}") from error
-            intervals: list[Interval] = []
-            for constraint_text in pooled[name]:
-                text = constraint_text.strip(_ASCII_WHITESPACE)
-                if not text:
-                    raise _conflict(
-                        "constraint_syntax",
-                        f"in dependency {name!r}: {constraint_text!r}")
-                for token in _CONSTRAINT_SEPARATOR.split(text):
-                    try:
-                        intervals.append(constraint_interval(token))
-                    except ResolveConflict as error:
-                        raise ResolveConflict(
-                            f"{error} in dependency {name!r}") from error
-            intersection = intersect_intervals(intervals)
-            lower, upper = intersection
-            if upper is not None and lower >= upper:
-                raise _conflict("empty_intersection", f"for dependency {name!r}")
-            if not interval_contains(intersection, version_triple):
-                raise _conflict(
-                    "version_mismatch",
-                    f"dependency {name!r} version {target['version']} does not satisfy "
-                    f"the merged constraints {sorted(set(pooled[name]))}")
+        manifests = self._read_manifest_closure(
+            root_digest,
+            lambda digest: _conflict("cycle", f"detected at blob {digest}"))
+        self._adjudicate(manifests)
 
         # Adjudication passed: name <-> digest is 1:1 among reachable non-root
         # manifests, so inbound constraints pool per digest exactly as per name.
