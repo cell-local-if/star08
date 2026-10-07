@@ -27,6 +27,7 @@ DIGEST_LENGTH = 64
 MAX_LIMIT = 100
 PRESENCE_MAX_DIGESTS = 100
 UPLOAD_STATE_VERSION = 1
+STORE_STATE_VERSION = 1
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
 _UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
@@ -83,6 +84,19 @@ class UploadStateError(StoreError):
 
 class UploadStateInvalid(Exception):
     """The upload state file is empty, corrupt, structurally wrong or version-incompatible."""
+
+
+class StoreStateError(StoreError):
+    """The store state file cannot be written; the request must not be confirmed."""
+
+    code, status = "internal_error", 500
+
+    def __init__(self) -> None:
+        super().__init__("store state write failed")
+
+
+class StoreStateInvalid(Exception):
+    """The store state file is empty, corrupt, structurally wrong or version-incompatible."""
 
 
 class MirrorError(StoreError):
@@ -471,6 +485,137 @@ class Blob:
     media_type: str
 
 
+class StoreState:
+    """JSON file backing the blob store so artifacts survive a process restart.
+
+    The file is rewritten atomically (temp file + fsync + rename) on every
+    confirmed store mutation (put, upload complete, mirror absorb, release,
+    gc). A failed write never replaces the previously persisted file, so a
+    restart restores only the last successful state. Loading is strictly
+    validated: anything empty, corrupt, structurally wrong or
+    version-incompatible raises StoreStateInvalid so the caller can refuse
+    to start.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def load(self) -> list[tuple[str, bytes, str, int]]:
+        """Return the persisted (digest, data, media_type, refs) tuples."""
+        try:
+            with open(self.path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            # A missing file means "nothing stored yet"; any other access
+            # problem surfaces on the first write as a 500.
+            if not os.path.exists(self.path):
+                return []
+            raise StoreStateInvalid(self.path)
+        if not raw:
+            raise StoreStateInvalid(self.path)
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise StoreStateInvalid(self.path) from None
+        try:
+            return self._parse(doc)
+        except StoreStateInvalid:
+            raise StoreStateInvalid(self.path) from None
+
+    @classmethod
+    def _parse(cls, doc: Any) -> list[tuple[str, bytes, str, int]]:
+        error = StoreStateInvalid("")
+        if not isinstance(doc, dict):
+            raise error
+        if set(doc) != {"version", "blobs"}:
+            raise error
+        version = doc["version"]
+        if not isinstance(version, int) or isinstance(version, bool) \
+                or version != STORE_STATE_VERSION:
+            raise error
+        entries = doc["blobs"]
+        if not isinstance(entries, list):
+            raise error
+        restored: list[tuple[str, bytes, str, int]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise error
+            if set(entry) != {"digest", "media_type", "refs", "data"}:
+                raise error
+            digest = entry["digest"]
+            if not is_digest(digest) or digest in seen:
+                raise error
+            seen.add(digest)
+            media_type = entry["media_type"]
+            if not isinstance(media_type, str) or not media_type or len(media_type) > 200:
+                raise error
+            refs = entry["refs"]
+            if not isinstance(refs, int) or isinstance(refs, bool) or refs < 0:
+                raise error
+            encoded = entry["data"]
+            if not isinstance(encoded, str):
+                raise error
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as cause:
+                raise error from cause
+            if not 1 <= len(data) <= MAX_BLOB:
+                raise error
+            # The digest must honestly name the bytes, or the file is not a
+            # state this process could have written.
+            if digest_of(data) != digest:
+                raise error
+            restored.append((digest, data, media_type, refs))
+        return restored
+
+    def save(self, blobs: dict[str, bytes], meta: dict[str, Blob],
+             refs: dict[str, int]) -> None:
+        """Atomically persist a full snapshot of the store.
+
+        Write failure (unwritable path, I/O error at any stage) is surfaced as
+        StoreStateError; the pre-existing state file is left untouched.
+        """
+        entries: list[dict[str, Any]] = []
+        for digest in sorted(meta):
+            entries.append({
+                "digest": digest,
+                "media_type": meta[digest].media_type,
+                "refs": refs[digest],
+                "data": base64.b64encode(blobs[digest]).decode("ascii"),
+            })
+        payload = json.dumps({"version": STORE_STATE_VERSION, "blobs": entries},
+                             ensure_ascii=False).encode("utf-8")
+        directory = os.path.dirname(os.path.abspath(self.path))
+        try:
+            handle, tmp_name = tempfile.mkstemp(dir=directory, prefix=".store-state-")
+            try:
+                with os.fdopen(handle, "wb") as tmp:
+                    tmp.write(payload)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.replace(tmp_name, self.path)
+                # Best-effort directory fsync so the rename itself is durable; on
+                # filesystems that reject fsync on a directory the rename above
+                # has already landed, so this must not turn into a failed write.
+                try:
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+                raise
+        except OSError as error:
+            raise StoreStateError() from error
+
+
 class Store:
     """In-memory, deduplicated by digest. `put` returns the blob metadata; repeats are no-ops.
 
@@ -480,9 +625,18 @@ class Store:
     at refs 0 still occupies quota until gc() reclaims it. Every write path
     checks the quota atomically with its commit, so a successful commit never
     leaves the store over the cap. Without the argument there is no cap.
+
+    With `state` (a StoreState) every confirmed mutation is persisted to the
+    state file under the store lock, before the call returns: a failed write
+    rolls the in-memory change back and surfaces as StoreStateError, so memory
+    and the last successful file never diverge. `restored` carries the
+    (digest, data, media_type, refs) tuples a StoreState.load() produced at
+    startup; refs-0 records are restored too and still wait for the next gc().
     """
 
-    def __init__(self, max_store_bytes: int | None = None) -> None:
+    def __init__(self, max_store_bytes: int | None = None,
+                 state: StoreState | None = None,
+                 restored: list[tuple[str, bytes, str, int]] | None = None) -> None:
         if max_store_bytes is not None and (
                 not isinstance(max_store_bytes, int) or isinstance(max_store_bytes, bool)
                 or max_store_bytes < 1):
@@ -492,6 +646,21 @@ class Store:
         self._meta: dict[str, Blob] = {}
         self._refs: dict[str, int] = {}
         self._max_store_bytes = max_store_bytes
+        self._state = state
+        for digest, data, media_type, refs in restored or ():
+            self._blobs[digest] = data
+            self._meta[digest] = Blob(digest, len(data), media_type)
+            self._refs[digest] = refs
+
+    def _persist_locked(self) -> None:
+        """Write the current snapshot to the configured state file, if any.
+
+        Caller must hold the lock. A StoreStateError leaves the on-disk file
+        untouched; the caller is expected to roll its mutation back so memory
+        keeps agreeing with the last successful file.
+        """
+        if self._state is not None:
+            self._state.save(self._blobs, self._meta, self._refs)
 
     def _stored_bytes(self) -> int:
         """Total raw bytes held right now. Caller must hold the lock."""
@@ -539,11 +708,23 @@ class Store:
         with self._lock:
             if digest in self._blobs:
                 self._refs[digest] += 1
+                try:
+                    self._persist_locked()
+                except StoreStateError:
+                    self._refs[digest] -= 1
+                    raise
             else:
                 self._quota_check(len(raw))
                 self._blobs[digest] = raw
                 self._meta[digest] = Blob(digest, len(raw), media_type or "application/octet-stream")
                 self._refs[digest] = 1
+                try:
+                    self._persist_locked()
+                except StoreStateError:
+                    del self._blobs[digest]
+                    del self._meta[digest]
+                    del self._refs[digest]
+                    raise
             return self._meta[digest]
 
     def get(self, digest: Any) -> bytes:
@@ -674,6 +855,16 @@ class Store:
                     synced.append(digest)
                 else:
                     missing.append(digest)
+            try:
+                # One persist for the whole batch: a multi-digest pull never
+                # lands on disk as a partial result.
+                self._persist_locked()
+            except StoreStateError:
+                for digest in synced:
+                    del self._blobs[digest]
+                    del self._meta[digest]
+                    del self._refs[digest]
+                raise
         return {"synced": synced, "existing": existing, "missing": missing}
 
     def release(self, digest: Any) -> int:
@@ -689,18 +880,33 @@ class Store:
             refs = self._refs[digest]
             if refs == 0:
                 raise DigestConflict(f"blob {digest} has no references left to release")
-            refs -= 1
-            self._refs[digest] = refs
-            return refs
+            self._refs[digest] = refs - 1
+            try:
+                self._persist_locked()
+            except StoreStateError:
+                self._refs[digest] = refs
+                raise
+            return refs - 1
 
     def gc(self) -> dict[str, Any]:
         """Atomically delete every blob with refs == 0; blobs still referenced are untouched."""
         with self._lock:
             deleted = sorted(d for d, refs in self._refs.items() if refs == 0)
+            held = {d: (self._blobs[d], self._meta[d]) for d in deleted}
             for digest in deleted:
                 del self._blobs[digest]
                 del self._meta[digest]
                 del self._refs[digest]
+            try:
+                self._persist_locked()
+            except StoreStateError:
+                # Reclaim not confirmed: every deleted record goes back untouched.
+                for digest in deleted:
+                    data, blob = held[digest]
+                    self._blobs[digest] = data
+                    self._meta[digest] = blob
+                    self._refs[digest] = 0
+                raise
             stats = {"blobs": len(self._blobs), "bytes": self._stored_bytes(),
                      "puts": sum(self._refs.values())}
         return {"deleted": deleted, "stats": stats}
@@ -986,11 +1192,23 @@ class Store:
         with self._lock:
             if digest in self._blobs:
                 self._refs[digest] += 1
+                try:
+                    self._persist_locked()
+                except StoreStateError:
+                    self._refs[digest] -= 1
+                    raise
             else:
                 self._quota_check(len(data))
                 self._blobs[digest] = data
                 self._meta[digest] = Blob(digest, len(data), media_type)
                 self._refs[digest] = 1
+                try:
+                    self._persist_locked()
+                except StoreStateError:
+                    del self._blobs[digest]
+                    del self._meta[digest]
+                    del self._refs[digest]
+                    raise
             return self._meta[digest]
 
 
@@ -1519,8 +1737,21 @@ class UploadManager:
                             raise
                         # Persistence is confirmed; only now does the process-memory
                         # blob store gain the blob/reference.
-                        blob = self._store.put_completed(data, session.declared_digest,
-                                                         session.media_type)
+                        try:
+                            blob = self._store.put_completed(data, session.declared_digest,
+                                                             session.media_type)
+                        except StoreStateError:
+                            # The blob was not confirmed: roll the session commit
+                            # back and restore the matching upload state on disk
+                            # (best effort — the request already failed).
+                            session.committed = False
+                            session.final_digest = None
+                            session.chunks = previous_chunks
+                            try:
+                                self._state.save(self._sessions)
+                            except UploadStateError:
+                                pass
+                            raise
                 return session, blob
         with session.lock:
             if session.deleted:
@@ -1771,8 +2002,15 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
 
 def serve(host: str = "127.0.0.1", port: int = 18895,
           upload_state: str | None = None,
-          max_store_bytes: int | None = None) -> ThreadingHTTPServer:
-    store = Store(max_store_bytes=max_store_bytes)
+          max_store_bytes: int | None = None,
+          store_state: str | None = None) -> ThreadingHTTPServer:
+    blob_state: StoreState | None = None
+    restored: list[tuple[str, bytes, str, int]] | None = None
+    if store_state is not None:
+        blob_state = StoreState(store_state)
+        # Refuse to listen on an empty/corrupt/structurally wrong/incompatible file.
+        restored = blob_state.load()
+    store = Store(max_store_bytes=max_store_bytes, state=blob_state, restored=restored)
     state: UploadState | None = None
     sessions: dict[str, UploadSession] | None = None
     if upload_state is not None:
@@ -1794,6 +2032,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18895)
     parser.add_argument("--upload-state", default=None,
                         help="path to the upload session state file (resumable across restarts)")
+    parser.add_argument("--store-state", default=None,
+                        help="path to the blob store state file "
+                             "(blobs, media types and refs survive restarts)")
     parser.add_argument("--max-store-bytes", type=int, default=None, metavar="N",
                         help="cap the total stored blob bytes at N (a positive integer); "
                              "writes that would exceed the cap fail with 413 quota_exceeded")
@@ -1801,9 +2042,13 @@ if __name__ == "__main__":
     if args.max_store_bytes is not None and args.max_store_bytes < 1:
         parser.error("--max-store-bytes must be a positive integer")
     try:
-        server = serve(args.host, args.port, args.upload_state, args.max_store_bytes)
+        server = serve(args.host, args.port, args.upload_state, args.max_store_bytes,
+                       args.store_state)
     except UploadStateInvalid as error:
         print(f"upload state invalid: {error}", file=sys.stderr)
+        sys.exit(1)
+    except StoreStateInvalid as error:
+        print(f"store state invalid: {error}", file=sys.stderr)
         sys.exit(1)
     print(f"artifact store listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
