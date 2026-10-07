@@ -7,11 +7,12 @@
 ```bash
 PYTHONPATH=src python3 -m artifacts.app --port 18895
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads.json
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --store-state ./store.json
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --max-store-bytes 268435456
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。
+Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**；blob 与引用计数状态默认在进程内存中。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。提供 `--store-state PATH`（`serve()` 的 `store_state` 参数同义）后，blob 字节、media type 与引用计数持久化到该文件，重启后完整恢复（见文末「制品存储持久化」）；两个状态路径相互独立，可单独或同时启用。
 
 可选的服务级容量配额：`--max-store-bytes N`（`serve()` 的 `max_store_bytes` 参数同义，取值为正整数）约束进程内**全部已存 blob 内容的总字节数**；不提供时无总容量上限。配额只按不同摘要实际占用的原始字节合计：重复 PUT 相同内容仍只存一份、refs +1，不增加占用；refs 降为 0 但尚未回收的 blob 仍占额，`POST /v1/gc` 删除后才释放。`PUT /v1/blobs`、上传会话 complete 与 `POST /v1/mirror/pull` 在成功写入前**原子**检查本次新增内容是否超限，任何成功提交后总占用都不越限；mirror/pull 仍为全有或全无，任一新增 blob 会超限则整批不入库。触发配额统一返回 `413`，响应体固定为 `{"error":{"code":"quota_exceeded","message":"store byte quota exceeded"}}`，本次操作不产生可见存储变化（complete 的会话保持 uncommitted 可续传）。各入口既有的 `400`/`404`/`409` 校验（空体、超单体上限、摘要格式、声明摘要不匹配、会话状态等）均先于配额判断；并发写入按单次操作原子裁决，两个同时成功的写入合计不会超限。
 
@@ -215,9 +216,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
   - **uncommitted** 会话保留已收字节、`received`、`size`、`media_type` 与可选声明 `digest`；客户端 GET 后从 `received` 对应偏移继续 PUT。
   - **committed** 会话以相同状态与实际 `digest` 查询；重复 complete 仍为 `409 conflict`，写入/删除仍为 `409 conflict`。
   - **已删除**会话恢复为不可见 tombstone：GET、PUT、DELETE、complete 一律 `404 not_found`。
-- 持久化**只覆盖上传会话**：complete 时写入的 blob 与引用计数仍是进程内存语义，不落盘；重启后 blob 存储为空，committed 会话只保留会话状态与 digest。HTTP 状态码、响应字段、分片大小、偏移裁决、摘要校验与并发原子性均不变。
+- 持久化**只覆盖上传会话**：complete 时写入的 blob 与引用计数仍是进程内存语义，不落盘；重启后 blob 存储为空，committed 会话只保留会话状态与 digest（除非同时启用下节的 `--store-state`）。HTTP 状态码、响应字段、分片大小、偏移裁决、摘要校验与并发原子性均不变。
 - 启动时状态文件**为空、损坏、结构不符或版本不兼容**：服务**不监听**，进程以非零状态退出，标准错误输出一行 `upload state invalid: <path>`；文件不存在等同于尚无会话，正常启动。
 - 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体为 `{"error":{"code":"internal_error","message":"upload state write failed"}}`；该次变更**不确认**并回滚，重启后只恢复最近一次成功持久化的状态。除上述启动与持久化失败结果外，现有校验优先级以及 `400 invalid_request`、`404 not_found`、`409 conflict` 的适用条件不变。
+
+## 制品存储持久化（`--store-state PATH`）
+
+- 未提供路径时行为与纯内存模式**完全一致**；提供后，`PUT /v1/blobs`、上传会话 complete、`POST /v1/mirror/pull`、`DELETE /v1/blobs/{digest}/refs`、`POST /v1/gc` 的成功变更都**先于成功响应**原子落盘（临时文件 + fsync + 原子替换整份快照）。并发请求仍逐次原子裁决，一次多 digest 操作（mirror/pull、gc）绝不持久化部分结果；每个成功请求完成时的内存状态与同路径重启后恢复的状态一致。
+- 用同一路径重启进程后，每个 digest 的**字节、media type 与 refs** 完整恢复，包括 refs 为 0 但尚未回收的记录——后者仍在下一次 `POST /v1/gc` 才被删除。GET、HEAD、Range、presence、分页、graph、resolve、lock、上传会话以及既有 `400`、`404`、`409`、`413`、`502` 的优先级和响应形状不变；单 blob 上限、配额原子判断与摘要校验继续保留。
+- 启动时状态文件**为空、损坏、结构不符或版本不兼容**：服务**不监听**，进程以非零状态退出，标准错误输出一行 `store state invalid: <path>`；文件不存在等同于空存储，正常启动。
+- 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体固定为 `{"error":{"code":"internal_error","message":"store state write failed"}}`；该次变更**不确认**，内存变更回滚，重启后只恢复最近一次成功持久化的状态。
+- `--upload-state` 与 `--store-state` 相互独立，可单独或同时启用；未配置 `--store-state` 时，complete 得到的 blob 重启后消失这一既有结果保留。
 
 ## 错误语义
 
@@ -229,4 +238,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、审计与可观测性、blob 与引用计数/垃圾回收的跨进程持久化。
+增量去重、签名与信任链、审计与可观测性。
