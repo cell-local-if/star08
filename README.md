@@ -173,6 +173,29 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 错误：请求形状、`base_url` 或摘要非法 ⇒ `400 invalid_request`；远端连接失败、presence 形状或覆盖错误、GET 非 200、摘要头或哈希不符、大小越界、媒体类型非法 ⇒ `502 {"error":{"code":"mirror_error","message":"remote sync failed"}}`。未知路径仍返回 `404`。并发本地写入继续遵守去重、refs、gc、上传状态与读取快照的既有原子语义。
 
+### `GET /v1/events`
+进程内审计查询：按提交顺序回放本进程内**成功提交**的变更事件。只读请求与失败请求（`400`/`404`/`409`/`413`/`502`、状态写入失败的 `500`）不产生事件。审计只存于进程内存：不写入 `--store-state` 或 `--upload-state`，重启后清空且 `seq` 从 1 重新计数。
+
+每个事件为 `{"seq","op","result"}`：`seq` 从 1 开始按提交顺序递增；`result` 沿用该请求原有成功 JSON，按操作补充 `upload_id` 或 `refs`，不适用字段省略。记录的 `op` 与 `result`：
+
+- `blob_put`（`PUT /v1/blobs`）：`{"digest","size","media_type","refs"}`，`refs` 为提交后的实际引用数（重复 PUT 记录实际 refs）。
+- `upload_create`：`{"upload_id","size","received","status"}`。
+- `upload_append`：`{"upload_id","received","status"}`。
+- `upload_delete`：`{"upload_id"}`（204 无其他字段）。
+- `upload_complete`：`{"upload_id","digest","size","media_type"}`。
+- `mirror_pull`：与成功响应相同的 `{"synced","existing","missing"}`；一次多 digest 拉取只记一条。
+- `blob_release`：`{"digest","refs"}`。
+- `gc`：与成功响应相同的 `{"deleted","stats"}`；一次调用只记一条。
+
+查询参数（只接受这两个）：
+
+- `after`：十进制非负整数，缺省 `0`；只返回 `seq` 严格大于它的事件。
+- `limit`：`1`–`100`，缺省 `50`。
+
+成功：`200 {"events":[...按 seq 升序...], "next_after":..., "has_more":...}`，只含这三个字段。`next_after` 为本页末条 `seq`，空页时等于 `after`；`has_more` 表示同一一致快照中是否还有后续事件。单次请求基于一次一致快照：并发提交既不拆分事件也不混入不属于同一时刻的页。未知、重复或非法参数 ⇒ `400 invalid_request`。
+
+审计事件与变更同属一次原子提交：只有变更确认才记录；事件插入失败时该变更**不提交**，对应请求返回 `500 {"error":{"code":"internal_error","message":"audit write failed"}}`。
+
 ## 可恢复上传会话
 
 把不超过 1 MiB 的 blob 以**每片非空且不超过 262144 字节（256 KiB）**的原始分片上传，支持断点续传。未提供 `--upload-state` 时会话仅存于当前进程内存，重启不恢复；提供状态路径时按本节末尾的持久化语义跨进程恢复。
@@ -239,4 +262,4 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 ## 未实现（后续任务候选，非固定题单）
 
-增量去重、签名与信任链、审计与可观测性。
+增量去重、签名与信任链、更全面的可观测性。
