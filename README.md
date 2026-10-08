@@ -8,11 +8,12 @@
 PYTHONPATH=src python3 -m artifacts.app --port 18895
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --upload-state ./uploads.json
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --store-state ./store.json
+PYTHONPATH=src python3 -m artifacts.app --port 18895 --audit-state ./audit.json
 PYTHONPATH=src python3 -m artifacts.app --port 18895 --max-store-bytes 268435456
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**。blob 字节、media type 与引用计数默认在进程内存中，重启即丢失；提供 `--store-state PATH`（`serve()` 的 `store_state` 参数同义）后，制品存储持久化到该文件，同路径重启后完整恢复（见下文「制品存储持久化」）。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。两个状态路径相互独立，可单独或同时启用。
+Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单个 blob 上限 **1 MiB**。blob 字节、media type 与引用计数默认在进程内存中，重启即丢失；提供 `--store-state PATH`（`serve()` 的 `store_state` 参数同义）后，制品存储持久化到该文件，同路径重启后完整恢复（见下文「制品存储持久化」）。上传会话默认同样仅存于内存；提供 `--upload-state PATH`（`serve()` 的 `upload_state` 参数同义）后，上传会话持久化到该文件，可跨越进程重启续传。审计历史默认仅存于进程内存；提供 `--audit-state PATH`（`serve()` 的 `audit_state` 参数同义）后，审计事件持久化到该文件，同路径重启后完整回放且 `seq` 接着最大值继续（见下文「审计历史持久化」）。三个状态路径相互独立，可分别或同时启用。
 
 可选的服务级容量配额：`--max-store-bytes N`（`serve()` 的 `max_store_bytes` 参数同义，取值为正整数）约束进程内**全部已存 blob 内容的总字节数**；不提供时无总容量上限。配额只按不同摘要实际占用的原始字节合计：重复 PUT 相同内容仍只存一份、refs +1，不增加占用；refs 降为 0 但尚未回收的 blob 仍占额，`POST /v1/gc` 删除后才释放。`PUT /v1/blobs`、上传会话 complete 与 `POST /v1/mirror/pull` 在成功写入前**原子**检查本次新增内容是否超限，任何成功提交后总占用都不越限；mirror/pull 仍为全有或全无，任一新增 blob 会超限则整批不入库。触发配额统一返回 `413`，响应体固定为 `{"error":{"code":"quota_exceeded","message":"store byte quota exceeded"}}`，本次操作不产生可见存储变化（complete 的会话保持 uncommitted 可续传）。各入口既有的 `400`/`404`/`409` 校验（空体、超单体上限、摘要格式、声明摘要不匹配、会话状态等）均先于配额判断；并发写入按单次操作原子裁决，两个同时成功的写入合计不会超限。
 
@@ -174,7 +175,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 错误：请求形状、`base_url` 或摘要非法 ⇒ `400 invalid_request`；远端连接失败、presence 形状或覆盖错误、GET 非 200、摘要头或哈希不符、大小越界、媒体类型非法 ⇒ `502 {"error":{"code":"mirror_error","message":"remote sync failed"}}`。未知路径仍返回 `404`。并发本地写入继续遵守去重、refs、gc、上传状态与读取快照的既有原子语义。
 
 ### `GET /v1/events`
-进程内审计查询：按提交顺序回放本进程内**成功提交**的变更事件。只读请求与失败请求（`400`/`404`/`409`/`413`/`502`、状态写入失败的 `500`）不产生事件。审计只存于进程内存：不写入 `--store-state` 或 `--upload-state`，重启后清空且 `seq` 从 1 重新计数。
+进程内审计查询：按提交顺序回放**成功提交**的变更事件。只读请求与失败请求（`400`/`404`/`409`/`413`/`502`、状态写入失败的 `500`）不产生事件。未配置 `--audit-state` 时审计只存于进程内存，不写入 `--store-state` 或 `--upload-state`，重启后清空且 `seq` 从 1 重新计数；配置后事件历史持久化到审计状态文件，同路径重启完整恢复，`seq` 接着最大已确认值连续递增（见下文「审计历史持久化」）。
 
 每个事件为 `{"seq","op","result"}`：`seq` 从 1 开始按提交顺序递增；`result` 沿用该请求原有成功 JSON，按操作补充 `upload_id` 或 `refs`，不适用字段省略。记录的 `op` 与 `result`：
 
@@ -194,7 +195,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 
 成功：`200 {"events":[...按 seq 升序...], "next_after":..., "has_more":...}`，只含这三个字段。`next_after` 为本页末条 `seq`，空页时等于 `after`；`has_more` 表示同一一致快照中是否还有后续事件。单次请求基于一次一致快照：并发提交既不拆分事件也不混入不属于同一时刻的页。未知、重复或非法参数 ⇒ `400 invalid_request`。
 
-审计事件与变更同属一次原子提交：只有变更确认才记录；事件插入失败时该变更**不提交**，对应请求返回 `500 {"error":{"code":"internal_error","message":"audit write failed"}}`。
+审计事件与变更同属一次原子提交：只有变更确认才记录；事件落盘失败时该变更**不提交**，对应请求返回 `500 {"error":{"code":"internal_error","message":"audit write failed"}}`，同次请求改动的制品或上传状态一并回退到请求开始时最近一次成功快照。
 
 ## 可恢复上传会话
 
@@ -250,7 +251,15 @@ Python 3.12，**仅标准库**；`127.0.0.1`，端口由 `--port` 指定；单�
 - 持久化语义与内存语义逐请求一致：重复 PUT 同字节只存一份并 refs +1，mirror pull 全有或全无（一次多 digest 操作绝不落盘成部分结果），release 一次减一，gc 只删 refs 为 0 并按 digest 字典序报告 `deleted`；并发请求仍逐次原子裁决，每个成功请求完成时的内存状态即重启后恢复的状态。
 - 状态文件**不存在**时等同于空存储，正常启动；文件**为空、损坏、结构不符或版本不兼容**时服务**不监听**，进程以非零状态退出，标准错误输出一行 `store state invalid: <path>`。
 - 状态路径运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体固定为 `{"error":{"code":"internal_error","message":"store state write failed"}}`；该次变更**不确认**并回滚内存，重启后只恢复最近一次成功持久化的状态。
-- `--store-state` 与 `--upload-state` 相互独立，可单独或同时启用；只配置 `--upload-state` 时 complete 得到的 blob 重启后消失这一既有结果保留。GET、HEAD、Range、presence、分页、graph、resolve、lock、上传会话以及既有 `400`、`404`、`409`、`413`、`502` 的优先级和响应形状均不受 `--store-state` 影响；单 blob 上限、配额原子判断与摘要校验同样保留。
+- `--store-state` 与 `--upload-state`、`--audit-state` 相互独立，可单独或同时启用；只配置 `--upload-state` 时 complete 得到的 blob 重启后消失这一既有结果保留。GET、HEAD、Range、presence、分页、graph、resolve、lock、上传会话以及既有 `400`、`404`、`409`、`413`、`502` 的优先级和响应形状均不受 `--store-state` 影响；单 blob 上限、配额原子判断与摘要校验同样保留。
+
+## 审计历史持久化（`--audit-state PATH`）
+
+- 未提供路径时行为与纯内存模式**完全一致**：审计只存于进程内存，重启清空且 `seq` 从 1 重新计数。提供后，`PUT /v1/blobs`、上传会话创建/追加/删除/完成、`POST /v1/mirror/pull`、释放引用、`POST /v1/gc` 的每一次成功提交都在**成功响应返回之前**向审计文件追加一条 `{"seq","op","result"}` 事件（临时文件 + fsync + 原子替换整份历史）。
+- 用同一路径重启进程后完整恢复历史：`GET /v1/events` 可回放重启前的全部已确认事件，`after`、`limit`、`next_after`、`has_more` 与单页一致快照语义不变；后续事件接着历史中**最大 seq** 连续递增，不重复、不跳号。并发提交的 seq 顺序即实际提交顺序，已确认变更的事件次序不会被交换。
+- 状态文件**不存在**时等同于空历史，正常启动；文件**为空、JSON 损坏、结构或版本不符、或事件不是从 1 开始的连续合法序列**（缺字段/多字段、seq 非正整数或重复/跳号、op 非非空字符串、result 非对象）时服务**不监听**，进程以非零状态退出，标准错误输出一行 `audit state invalid: <path>`。
+- 审计文件运行中不可写、或某次写入失败：对应请求返回 `500 internal_error`，响应体固定为 `{"error":{"code":"internal_error","message":"audit write failed"}}`；事件不落盘，本次变更**不确认**——若同请求还改动了制品或上传状态，这些状态回退到请求开始时最近一次成功快照（内存回滚，store/upload 状态文件恢复为请求前内容），随后重试沿用未占用的 seq。成功响应只在事件（及其余状态）全部落盘后才返回；重启后不会出现无事件的变更，也不会出现无变更的事件。
+- 失败请求、校验错误、远端同步失败与配额拒绝均不生成事件；`--audit-state` 不改变摘要校验、引用计数、配额、Range、presence、graph、resolve、lock、mirror 与上传会话的公开行为、错误优先级及既有 `op`/`result` 字段，纯内存模式及未启用审计落盘时的 HTTP 状态、JSON、并发裁决和重启丢失语义保持兼容。
 
 ## 错误语义
 

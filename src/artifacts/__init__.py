@@ -15,8 +15,11 @@ warnings.filterwarnings(
 from .app import (  # noqa: E402,F401
     CHUNK_MAX,
     MAX_BLOB,
+    AUDIT_STATE_VERSION,
     AuditError,
     AuditLog,
+    AuditState,
+    AuditStateInvalid,
     Blob,
     BlobNotFound,
     DigestConflict,
@@ -60,8 +63,11 @@ from .app import (  # noqa: E402,F401
 __all__ = [
     "CHUNK_MAX",
     "MAX_BLOB",
+    "AUDIT_STATE_VERSION",
     "AuditError",
     "AuditLog",
+    "AuditState",
+    "AuditStateInvalid",
     "Blob",
     "BlobNotFound",
     "DigestConflict",

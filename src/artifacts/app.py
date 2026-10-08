@@ -28,6 +28,12 @@ MAX_LIMIT = 100
 PRESENCE_MAX_DIGESTS = 100
 UPLOAD_STATE_VERSION = 1
 STORE_STATE_VERSION = 1
+AUDIT_STATE_VERSION = 1
+# Every op this process can append; a restored file may name only these.
+_AUDIT_OPS = frozenset({
+    "blob_put", "upload_create", "upload_append", "upload_delete",
+    "upload_complete", "mirror_pull", "blob_release", "gc",
+})
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = frozenset("0123456789abcdef")
 _UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
@@ -97,6 +103,10 @@ class StoreStateError(StoreError):
 
 class StoreStateInvalid(Exception):
     """The store state file is empty, corrupt, structurally wrong or version-incompatible."""
+
+
+class AuditStateInvalid(Exception):
+    """The audit state file is empty, corrupt, structurally wrong or version-incompatible."""
 
 
 class MirrorError(StoreError):
@@ -877,29 +887,136 @@ class StoreState:
             raise StoreStateError() from error
 
 
+class AuditState:
+    """JSON file backing the audit history so events survive a process restart.
+
+    Like StoreState/UploadState the file is rewritten atomically (temp file +
+    fsync + rename) on every confirmed commit. Loading is strictly validated:
+    a missing file means an empty history, while anything empty, corrupt,
+    structurally wrong, version-incompatible, or holding an event sequence
+    that is not exactly ``{seq, op, result}`` triples numbered from 1 with no
+    gaps or repeats raises AuditStateInvalid so the caller refuses to start.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def load(self) -> list[dict[str, Any]]:
+        """Return the persisted events in file order (already validated)."""
+        try:
+            with open(self.path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            # A missing file means "no events yet"; any other access problem
+            # surfaces on the first write as a 500.
+            if not os.path.exists(self.path):
+                return []
+            raise AuditStateInvalid(self.path)
+        if not raw:
+            raise AuditStateInvalid(self.path)
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AuditStateInvalid(self.path) from None
+        try:
+            return self._parse(doc)
+        except AuditStateInvalid:
+            raise AuditStateInvalid(self.path) from None
+
+    @classmethod
+    def _parse(cls, doc: Any) -> list[dict[str, Any]]:
+        error = AuditStateInvalid("")
+        if not isinstance(doc, dict):
+            raise error
+        if set(doc) != {"version", "events"}:
+            raise error
+        version = doc["version"]
+        if not isinstance(version, int) or isinstance(version, bool) \
+                or version != AUDIT_STATE_VERSION:
+            raise error
+        entries = doc["events"]
+        if not isinstance(entries, list):
+            raise error
+        events: list[dict[str, Any]] = []
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict) or set(entry) != {"seq", "op", "result"}:
+                raise error
+            seq = entry["seq"]
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq != index:
+                raise error
+            op = entry["op"]
+            if not isinstance(op, str) or op not in _AUDIT_OPS:
+                raise error
+            result = entry["result"]
+            if not isinstance(result, dict):
+                raise error
+            events.append({"seq": seq, "op": op, "result": result})
+        return events
+
+    def save(self, events: list[dict[str, Any]]) -> str | None:
+        """Atomically persist the full event history.
+
+        Write failure is surfaced as AuditError and never replaces the
+        previously persisted file. As with StoreState.save, success returns a
+        token parking the previous file (or its absence) for discard once the
+        commit is fully confirmed or verbatim restore when it is aborted.
+        """
+        payload = json.dumps({"version": AUDIT_STATE_VERSION, "events": events},
+                             ensure_ascii=False).encode("utf-8")
+        try:
+            return _write_state_atomically(self.path, payload, "audit-state")
+        except OSError as error:
+            raise AuditError() from error
+
+
 class AuditLog:
-    """In-process audit trail of confirmed mutations, in commit order.
+    """Audit trail of confirmed mutations, in commit order, optionally on disk.
 
     Every successful atomic commit of a mutating request appends exactly one
     event carrying the next sequence number (from 1) and that request's
-    success payload. The trail lives only in process memory: nothing is
-    written to the store/upload state files, and a restart clears it and
-    restarts the sequence at 1. Appends happen inside the same critical
-    section that commits the mutation, so seq order is commit order and a
-    failed append aborts the commit itself (the caller rolls the mutation
-    back and surfaces AuditError).
+    success payload. Without an AuditState the trail lives only in process
+    memory: a restart clears it and restarts the sequence at 1. With an
+    AuditState the full history is loaded at startup and validated to be a
+    consecutive legal sequence; later events continue after the largest seq.
+    Appends happen inside the same critical section that commits the
+    mutation (each AuditLog call takes one lock), so seq order is commit
+    order and a failed persist aborts the commit itself (the caller rolls
+    the mutation back and surfaces AuditError).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state: AuditState | None = None,
+                 restored: list[dict[str, Any]] | None = None) -> None:
         self._lock = threading.Lock()
-        self._events: list[dict[str, Any]] = []
-        self._next_seq = 1
+        self._state = state
+        self._events: list[dict[str, Any]] = list(restored or ())
+        self._next_seq = len(self._events) + 1
 
-    def record(self, op: str, result: dict[str, Any]) -> None:
-        """Append one event; the caller already holds the committing lock."""
+    def record(self, op: str, result: dict[str, Any]) -> str | None:
+        """Append one event; persist atomically when a state file is configured.
+
+        Caller already holds the committing lock, and AuditLog's own lock
+        additionally serializes event order across different committing
+        locks (blob store vs. upload sessions): seq assignment, persistence
+        and visibility are one serial step, so concurrent confirmed commits
+        never swap their event order. The returned token parks the state
+        file the request started with; the caller discards it once the whole
+        commit is confirmed or restores it verbatim when a later commit
+        step aborts. A persist failure leaves both the on-disk file (the
+        atomic writer restores the parked snapshot itself) and the
+        in-memory history at the previous event and raises AuditError, so
+        the caller does not confirm the mutation and a retry reuses this seq.
+        """
         with self._lock:
-            self._events.append({"seq": self._next_seq, "op": op, "result": result})
+            event = {"seq": self._next_seq, "op": op, "result": result}
+            backup: str | None = None
+            if self._state is not None:
+                # Persist a snapshot that already contains the new event
+                # before making it visible in memory; a failure here changes
+                # neither side.
+                backup = self._state.save(self._events + [event])
+            self._events.append(event)
             self._next_seq += 1
+            return backup
 
     def query(self, after: int, limit: int) -> dict[str, Any]:
         """One consistent snapshot: the page of events with seq > `after`, ascending.
@@ -908,7 +1025,7 @@ class AuditLog:
         event nor mix events into a page that did not exist together.
         """
         with self._lock:
-            matching = [event for event in self._events if event["seq"] > after]
+            matching = [dict(event) for event in self._events if event["seq"] > after]
             page = matching[:limit]
             return {
                 "events": page,
@@ -969,15 +1086,17 @@ class Store:
             return self._state.save(self._blobs, self._meta, self._refs)
         return None
 
-    def _record_audit(self, op: str, result: dict[str, Any]) -> None:
+    def _record_audit(self, op: str, result: dict[str, Any]) -> str | None:
         """Append the audit event for a commit; any failure aborts the commit.
 
-        Caller must hold the committing lock. An audit append that raises for
-        any reason surfaces as AuditError so the caller rolls the mutation
-        back instead of confirming it.
+        Caller must hold the committing lock. Returns the token parking the
+        audit state file the request started with (``None`` without an audit
+        state); the caller discards it once the commit is fully confirmed.
+        An audit persist that raises for any reason surfaces as AuditError so
+        the caller rolls the mutation back instead of confirming it.
         """
         try:
-            self.audit.record(op, result)
+            return self.audit.record(op, result)
         except AuditError:
             raise
         except Exception as error:
@@ -992,7 +1111,10 @@ class Store:
         with the state file untouched; an audit failure rolls the mutation
         back and restores the exact state file the request started with
         (including "no file yet") and raises AuditError — the change is
-        confirmed only when both sides have accepted it.
+        confirmed only when every side has accepted it. The audit snapshot
+        itself is written atomically by AuditLog (a failed write restores
+        the audit file it parked and appends no event), and its backup is
+        discarded only once the whole commit is confirmed.
         """
         try:
             backup = self._persist_locked()
@@ -1000,13 +1122,14 @@ class Store:
             rollback()
             raise
         try:
-            self._record_audit(op, result)
+            audit_backup = self._record_audit(op, result)
         except AuditError:
             rollback()
             if self._state is not None:
                 _restore_state_file(self._state.path, backup)
             raise
         _discard_state_backup(backup)
+        _discard_state_backup(audit_backup)
 
     def _stored_bytes(self) -> int:
         """Total raw bytes held right now. Caller must hold the lock."""
@@ -1727,9 +1850,16 @@ class UploadManager:
         self._state = state
         self._sessions: dict[str, UploadSession] = sessions if sessions is not None else {}
 
-    def _record_audit(self, op: str, result: dict[str, Any]) -> None:
-        """Append the audit event for a confirmed session mutation (see Store._record_audit)."""
-        self._store._record_audit(op, result)
+    def _record_audit(self, op: str, result: dict[str, Any]) -> str | None:
+        """Append the audit event for a confirmed session mutation.
+
+        Returns the token parking the audit state file the request started
+        with (``None`` without an audit state); discard it once the upload
+        side is also confirmed. A failure already restored the audit file
+        inside AuditLog and appended no event, so the caller only rolls the
+        session/upload state back.
+        """
+        return self._store._record_audit(op, result)
 
     @staticmethod
     def parse_create(raw: bytes) -> tuple[int, str, str | None]:
@@ -1780,7 +1910,7 @@ class UploadManager:
                         del self._sessions[upload_id]
                     raise
                 try:
-                    self._record_audit("upload_create", {
+                    audit_backup = self._record_audit("upload_create", {
                         "upload_id": upload_id, "size": size,
                         "received": 0, "status": "uncommitted",
                     })
@@ -1793,6 +1923,7 @@ class UploadManager:
                     _restore_state_file(self._state.path, backup)
                     raise
                 _discard_state_backup(backup)
+                _discard_state_backup(audit_backup)
                 return session
         with self._lock:
             while True:
@@ -1802,13 +1933,14 @@ class UploadManager:
             session = UploadSession(upload_id, size, media_type, declared_digest)
             self._sessions[upload_id] = session
             try:
-                self._record_audit("upload_create", {
+                audit_backup = self._record_audit("upload_create", {
                     "upload_id": upload_id, "size": size,
                     "received": 0, "status": "uncommitted",
                 })
             except AuditError:
                 del self._sessions[upload_id]
                 raise
+            _discard_state_backup(audit_backup)
             return session
 
     def _live(self, upload_id: str) -> UploadSession:
@@ -1852,7 +1984,7 @@ class UploadManager:
                         session.received -= len(chunk)
                         raise
                     try:
-                        self._record_audit("upload_append", {
+                        audit_backup = self._record_audit("upload_append", {
                             "upload_id": upload_id,
                             "received": session.received,
                             "status": "committed" if session.committed else "uncommitted",
@@ -1865,6 +1997,7 @@ class UploadManager:
                         _restore_state_file(self._state.path, backup)
                         raise
                     _discard_state_backup(backup)
+                    _discard_state_backup(audit_backup)
                     return session
         with session.lock:
             # A concurrent delete (serialized on this same lock) may have tombstoned it.
@@ -1879,7 +2012,7 @@ class UploadManager:
             session.chunks.append(chunk)
             session.received += len(chunk)
             try:
-                self._record_audit("upload_append", {
+                audit_backup = self._record_audit("upload_append", {
                     "upload_id": upload_id,
                     "received": session.received,
                     "status": "uncommitted",
@@ -1888,6 +2021,7 @@ class UploadManager:
                 session.chunks.pop()
                 session.received -= len(chunk)
                 raise
+            _discard_state_backup(audit_backup)
             return session
 
     @staticmethod
@@ -1922,13 +2056,15 @@ class UploadManager:
                         session.chunks = previous_chunks
                         raise
                     try:
-                        self._record_audit("upload_delete", {"upload_id": upload_id})
+                        audit_backup = self._record_audit(
+                            "upload_delete", {"upload_id": upload_id})
                     except AuditError:
                         session.deleted = False
                         session.chunks = previous_chunks
                         _restore_state_file(self._state.path, backup)
                         raise
                     _discard_state_backup(backup)
+                    _discard_state_backup(audit_backup)
                 return
         with session.lock:
             if session.committed:
@@ -1938,11 +2074,13 @@ class UploadManager:
             session.deleted = True
             session.chunks = []
             try:
-                self._record_audit("upload_delete", {"upload_id": upload_id})
+                audit_backup = self._record_audit(
+                    "upload_delete", {"upload_id": upload_id})
             except AuditError:
                 session.deleted = False
                 session.chunks = previous_chunks
                 raise
+            _discard_state_backup(audit_backup)
 
     def complete(self, upload_id: str) -> tuple[UploadSession, Blob]:
         session = self._live(upload_id)
@@ -2266,14 +2404,23 @@ def make_handler(store: Store, uploads: UploadManager | None = None) -> type[Bas
 def serve(host: str = "127.0.0.1", port: int = 18895,
           upload_state: str | None = None,
           max_store_bytes: int | None = None,
-          store_state: str | None = None) -> ThreadingHTTPServer:
+          store_state: str | None = None,
+          audit_state: str | None = None) -> ThreadingHTTPServer:
     blob_state: StoreState | None = None
     restored: list[tuple[str, bytes, str, int]] | None = None
     if store_state is not None:
         blob_state = StoreState(store_state)
         # Refuse to listen on an empty/corrupt/structurally wrong/incompatible file.
         restored = blob_state.load()
-    store = Store(max_store_bytes=max_store_bytes, state=blob_state, restored=restored)
+    audit: AuditLog | None = None
+    if audit_state is not None:
+        audit_log_state = AuditState(audit_state)
+        # Refuse to listen on an empty/corrupt/structurally wrong/incompatible
+        # file, or one whose events are not a consecutive legal sequence.
+        audit_events = audit_log_state.load()
+        audit = AuditLog(state=audit_log_state, restored=audit_events)
+    store = Store(max_store_bytes=max_store_bytes, state=blob_state,
+                  restored=restored, audit=audit)
     state: UploadState | None = None
     sessions: dict[str, UploadSession] | None = None
     if upload_state is not None:
@@ -2299,6 +2446,9 @@ if __name__ == "__main__":
     parser.add_argument("--store-state", default=None,
                         help="path to the blob store state file "
                              "(blobs, media types and refs survive restarts)")
+    parser.add_argument("--audit-state", default=None,
+                        help="path to the audit history state file "
+                             "(GET /v1/events history and seq survive restarts)")
     parser.add_argument("--max-store-bytes", type=int, default=None, metavar="N",
                         help="cap the total stored blob bytes at N (a positive integer); "
                              "writes that would exceed the cap fail with 413 quota_exceeded")
@@ -2307,12 +2457,15 @@ if __name__ == "__main__":
         parser.error("--max-store-bytes must be a positive integer")
     try:
         server = serve(args.host, args.port, args.upload_state, args.max_store_bytes,
-                       args.store_state)
+                       args.store_state, args.audit_state)
     except UploadStateInvalid as error:
         print(f"upload state invalid: {error}", file=sys.stderr)
         sys.exit(1)
     except StoreStateInvalid as error:
         print(f"store state invalid: {error}", file=sys.stderr)
+        sys.exit(1)
+    except AuditStateInvalid as error:
+        print(f"audit state invalid: {error}", file=sys.stderr)
         sys.exit(1)
     print(f"artifact store listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
