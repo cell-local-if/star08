@@ -661,6 +661,110 @@ class Blob:
     media_type: str
 
 
+def _fsync_directory(directory: str) -> None:
+    """Best-effort fsync of a directory so a rename/unlink itself is durable.
+
+    Filesystems that reject fsync on a directory are ignored: the preceding
+    rename has already landed.
+    """
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
+
+
+def _write_state_atomically(path: str, payload: bytes, prefix: str) -> str | None:
+    """Write ``payload`` to ``path`` atomically, parking the previous file first.
+
+    The new snapshot is written and fsynced in a temp file; whatever ``path``
+    currently names (nothing, or the last good snapshot) is then renamed aside
+    to a backup slot *before* the new snapshot is renamed into place. The
+    returned token is the backup path (``None`` when ``path`` did not exist),
+    so the caller can either discard it once the commit is fully confirmed or
+    restore it byte-for-byte — "no file" included — when a later commit step
+    (the audit append) rejects the change.
+
+    A failure while swapping restores the parked file immediately and leaves
+    the pre-existing state in place; any OSError propagates to the caller,
+    which maps it to its StoreStateError/UploadStateError.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    # Reserve the backup scratch name first, then the new-snapshot temp file,
+    # so a reservation failure leaks neither.
+    backup_fd, backup_name = tempfile.mkstemp(dir=directory, prefix=f".{prefix}-old-")
+    os.close(backup_fd)
+    os.unlink(backup_name)
+    handle, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{prefix}-new-")
+    parked = False  # True once backup_name holds the previous path contents
+    try:
+        with os.fdopen(handle, "wb") as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        try:
+            os.rename(path, backup_name)
+        except FileNotFoundError:
+            pass  # path did not exist: restoring means leaving it absent
+        else:
+            parked = True
+        try:
+            os.replace(tmp_name, path)
+        except OSError:
+            # The new snapshot never landed; put the parked file straight back
+            # so a write failure leaves the pre-existing state untouched.
+            if parked:
+                os.replace(backup_name, path)
+                parked = False
+            raise
+        _fsync_directory(directory)
+        return backup_name if parked else None
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        if parked:
+            try:
+                os.replace(backup_name, path)
+                _fsync_directory(directory)
+            except OSError:
+                pass
+        raise
+
+
+def _discard_state_backup(backup: str | None) -> None:
+    """Drop the parked previous snapshot after a commit is fully confirmed."""
+    if backup is not None:
+        try:
+            os.unlink(backup)
+        except FileNotFoundError:
+            pass
+
+
+def _restore_state_file(path: str, backup: str | None) -> None:
+    """Best-effort restore of the state parked by ``_write_state_atomically``.
+
+    A backup file is renamed back over ``path``; a ``None`` backup restores the
+    "file absent" state the request started from. Either way the result is the
+    last confirmed snapshot, ready for a same-path restart.
+    """
+    try:
+        if backup is not None:
+            os.replace(backup, path)
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        _fsync_directory(os.path.dirname(os.path.abspath(path)))
+    except OSError:
+        pass
+
+
 class StoreState:
     """JSON file backing the blob store so artifacts survive a process restart.
 
@@ -746,11 +850,16 @@ class StoreState:
         return restored
 
     def save(self, blobs: dict[str, bytes], meta: dict[str, Blob],
-             refs: dict[str, int]) -> None:
+             refs: dict[str, int]) -> str | None:
         """Atomically persist a full snapshot of the store.
 
         Write failure (unwritable path, I/O error at any stage) is surfaced as
-        StoreStateError; the pre-existing state file is left untouched.
+        StoreStateError; the pre-existing state file is left untouched. On
+        success the returned token parks whatever file (or absence) the store
+        had before this snapshot; the caller keeps it until the rest of the
+        commit (the audit append) has succeeded and then discards it, or
+        restores it verbatim via ``_restore_state_file`` when the commit is
+        aborted.
         """
         entries: list[dict[str, Any]] = []
         for digest in sorted(meta):
@@ -762,32 +871,8 @@ class StoreState:
             })
         payload = json.dumps({"version": STORE_STATE_VERSION, "blobs": entries},
                              ensure_ascii=False).encode("utf-8")
-        directory = os.path.dirname(os.path.abspath(self.path))
         try:
-            handle, tmp_name = tempfile.mkstemp(dir=directory, prefix=".store-state-")
-            try:
-                with os.fdopen(handle, "wb") as tmp:
-                    tmp.write(payload)
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
-                os.replace(tmp_name, self.path)
-                # Best-effort directory fsync so the rename itself is durable; on
-                # filesystems that reject fsync on a directory the rename above
-                # has already landed, so this must not turn into a failed write.
-                try:
-                    directory_fd = os.open(directory, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                except OSError:
-                    pass
-            except BaseException:
-                try:
-                    os.unlink(tmp_name)
-                except FileNotFoundError:
-                    pass
-                raise
+            return _write_state_atomically(self.path, payload, "store-state")
         except OSError as error:
             raise StoreStateError() from error
 
@@ -870,15 +955,19 @@ class Store:
             self._meta[digest] = Blob(digest, len(data), media_type)
             self._refs[digest] = refs
 
-    def _persist_locked(self) -> None:
+    def _persist_locked(self) -> str | None:
         """Write the current snapshot to the configured state file, if any.
 
-        Caller must hold the lock. A StoreStateError leaves the on-disk file
+        Caller must hold the lock. Returns the token parking the previous file
+        (or ``None`` when there was no state/no previous file); the caller
+        discards it once the commit is fully confirmed, or restores it when a
+        later commit step aborts. A StoreStateError leaves the on-disk file
         untouched; the caller is expected to roll its mutation back so memory
         keeps agreeing with the last successful file.
         """
         if self._state is not None:
-            self._state.save(self._blobs, self._meta, self._refs)
+            return self._state.save(self._blobs, self._meta, self._refs)
+        return None
 
     def _record_audit(self, op: str, result: dict[str, Any]) -> None:
         """Append the audit event for a commit; any failure aborts the commit.
@@ -901,11 +990,12 @@ class Store:
         Caller must hold the lock with the in-memory mutation applied. A
         persist failure rolls the mutation back and raises StoreStateError
         with the state file untouched; an audit failure rolls the mutation
-        back, restores the state file best-effort and raises AuditError —
-        the change is confirmed only when both sides have accepted it.
+        back and restores the exact state file the request started with
+        (including "no file yet") and raises AuditError — the change is
+        confirmed only when both sides have accepted it.
         """
         try:
-            self._persist_locked()
+            backup = self._persist_locked()
         except StoreStateError:
             rollback()
             raise
@@ -913,11 +1003,10 @@ class Store:
             self._record_audit(op, result)
         except AuditError:
             rollback()
-            try:
-                self._persist_locked()
-            except StoreStateError:
-                pass
+            if self._state is not None:
+                _restore_state_file(self._state.path, backup)
             raise
+        _discard_state_backup(backup)
 
     def _stored_bytes(self) -> int:
         """Total raw bytes held right now. Caller must hold the lock."""
@@ -1316,10 +1405,11 @@ class Store:
                 self._commit_locked(audit_event[0], audit_event[1], rollback)
             else:
                 try:
-                    self._persist_locked()
+                    backup = self._persist_locked()
                 except StoreStateError:
                     rollback()
                     raise
+                _discard_state_backup(backup)
             return self._meta[digest]
 
 
@@ -1587,11 +1677,14 @@ class UploadState:
             sessions[upload_id] = session
         return sessions
 
-    def save(self, sessions: dict[str, UploadSession]) -> None:
+    def save(self, sessions: dict[str, UploadSession]) -> str | None:
         """Atomically persist a snapshot of every live/tombstoned session.
 
         Write failure (unwritable path, I/O error at any stage) is surfaced as
-        UploadStateError; the pre-existing state file is left untouched.
+        UploadStateError; the pre-existing state file is left untouched. As
+        with StoreState.save, success returns a token parking the previous
+        file (or its absence) for discard on commit confirmation or verbatim
+        restore when the audit append aborts it.
         """
         entries: list[dict[str, Any]] = []
         for upload_id in sorted(sessions):
@@ -1609,32 +1702,8 @@ class UploadState:
             })
         payload = json.dumps({"version": UPLOAD_STATE_VERSION, "sessions": entries},
                              ensure_ascii=False).encode("utf-8")
-        directory = os.path.dirname(os.path.abspath(self.path))
         try:
-            handle, tmp_name = tempfile.mkstemp(dir=directory, prefix=".upload-state-")
-            try:
-                with os.fdopen(handle, "wb") as tmp:
-                    tmp.write(payload)
-                    tmp.flush()
-                    os.fsync(tmp.fileno())
-                os.replace(tmp_name, self.path)
-                # Best-effort directory fsync so the rename itself is durable; on
-                # filesystems that reject fsync on a directory the rename above
-                # has already landed, so this must not turn into a failed write.
-                try:
-                    directory_fd = os.open(directory, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                except OSError:
-                    pass
-            except BaseException:
-                try:
-                    os.unlink(tmp_name)
-                except FileNotFoundError:
-                    pass
-                raise
+            return _write_state_atomically(self.path, payload, "upload-state")
         except OSError as error:
             raise UploadStateError() from error
 
@@ -1705,7 +1774,7 @@ class UploadManager:
                     session = UploadSession(upload_id, size, media_type, declared_digest)
                     self._sessions[upload_id] = session
                 try:
-                    self._state.save(self._sessions)
+                    backup = self._state.save(self._sessions)
                 except UploadStateError:
                     with self._lock:
                         del self._sessions[upload_id]
@@ -1717,15 +1786,13 @@ class UploadManager:
                     })
                 except AuditError:
                     # The change is not confirmed: drop the session and restore
-                    # the last confirmed state file (best effort — the request
-                    # already failed).
+                    # the exact state file the request started with (including
+                    # "no file yet"), so memory and disk both show no session.
                     with self._lock:
                         del self._sessions[upload_id]
-                    try:
-                        self._state.save(self._sessions)
-                    except UploadStateError:
-                        pass
+                    _restore_state_file(self._state.path, backup)
                     raise
+                _discard_state_backup(backup)
                 return session
         with self._lock:
             while True:
@@ -1777,7 +1844,7 @@ class UploadManager:
                     session.chunks.append(chunk)
                     session.received += len(chunk)
                     try:
-                        self._state.save(self._sessions)
+                        backup = self._state.save(self._sessions)
                     except UploadStateError:
                         # The change is not confirmed: roll back so the session
                         # and the last successful state file agree.
@@ -1791,14 +1858,13 @@ class UploadManager:
                             "status": "committed" if session.committed else "uncommitted",
                         })
                     except AuditError:
-                        # Not confirmed either: same rollback as a failed write.
+                        # Not confirmed either: roll the chunk back and restore
+                        # the exact state file the request started with.
                         session.chunks.pop()
                         session.received -= len(chunk)
-                        try:
-                            self._state.save(self._sessions)
-                        except UploadStateError:
-                            pass
+                        _restore_state_file(self._state.path, backup)
                         raise
+                    _discard_state_backup(backup)
                     return session
         with session.lock:
             # A concurrent delete (serialized on this same lock) may have tombstoned it.
@@ -1850,7 +1916,7 @@ class UploadManager:
                     session.deleted = True
                     session.chunks = []
                     try:
-                        self._state.save(self._sessions)
+                        backup = self._state.save(self._sessions)
                     except UploadStateError:
                         session.deleted = False
                         session.chunks = previous_chunks
@@ -1860,11 +1926,9 @@ class UploadManager:
                     except AuditError:
                         session.deleted = False
                         session.chunks = previous_chunks
-                        try:
-                            self._state.save(self._sessions)
-                        except UploadStateError:
-                            pass
+                        _restore_state_file(self._state.path, backup)
                         raise
+                    _discard_state_backup(backup)
                 return
         with session.lock:
             if session.committed:
@@ -1909,7 +1973,7 @@ class UploadManager:
                         session.final_digest = digest
                         session.chunks = []
                         try:
-                            self._state.save(self._sessions)
+                            upload_backup = self._state.save(self._sessions)
                         except UploadStateError:
                             # Commit not confirmed: roll the session back; nothing was stored.
                             session.committed = False
@@ -1928,31 +1992,18 @@ class UploadManager:
                                     "size": len(data),
                                     "media_type": session.media_type,
                                 }))
-                        except AuditError:
-                            # The audit trail rejected the event and the store
-                            # already rolled the blob side back; roll the session
-                            # commit back and restore the matching upload state
-                            # on disk (best effort — the request already failed).
+                        except (AuditError, StoreStateError):
+                            # The blob side was not confirmed (put_completed
+                            # already rolled it back, and on audit failure also
+                            # restored the store file): roll the session commit
+                            # back and restore the exact upload state file the
+                            # request started with, so neither state confirms it.
                             session.committed = False
                             session.final_digest = None
                             session.chunks = previous_chunks
-                            try:
-                                self._state.save(self._sessions)
-                            except UploadStateError:
-                                pass
+                            _restore_state_file(self._state.path, upload_backup)
                             raise
-                        except StoreStateError:
-                            # The blob was not confirmed: roll the session commit
-                            # back and restore the matching upload state on disk
-                            # (best effort — the request already failed).
-                            session.committed = False
-                            session.final_digest = None
-                            session.chunks = previous_chunks
-                            try:
-                                self._state.save(self._sessions)
-                            except UploadStateError:
-                                pass
-                            raise
+                        _discard_state_backup(upload_backup)
                 return session, blob
         with session.lock:
             if session.deleted:
